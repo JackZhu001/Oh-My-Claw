@@ -1,0 +1,1025 @@
+"""
+Agent 实现
+
+支持原生 Function Calling 的代码分析 Agent。
+
+这是整个项目的核心模块，实现了基于 Function Calling 的 Agent 循环：
+1. 接收用户输入
+2. 调用 LLM（带上工具列表）
+3. 如果 LLM 请求调用工具，执行工具并获取结果
+4. 将工具结果返回给 LLM
+5. 重复步骤 2-4，直到 LLM 给出最终答案
+
+与传统 ReAct 的区别：
+- ReAct: 解析 LLM 输出的文本（Action: ...），容易出错
+- Function Calling: LLM 直接返回结构化的 tool_calls，更可靠
+"""
+
+import json
+import uuid
+import time
+from typing import List, Optional, Callable
+from pathlib import Path
+
+from codemate_agent.llm.client import GLMClient
+from codemate_agent.schema import Message, LLMResponse, ToolCall
+from codemate_agent.tools.base import Tool
+from codemate_agent.tools.registry import ToolRegistry
+from codemate_agent.logging import setup_logger, TraceLogger, SessionMetrics, generate_session_id, TraceEventType
+from codemate_agent.persistence import SessionStorage, MemoryManager
+from codemate_agent.context import ContextCompressor, CompressionConfig, ObservationTruncator
+from codemate_agent.planner import TaskPlanner
+from codemate_agent.subagent import TaskTool
+from codemate_agent.validation import ArgumentValidator
+
+
+# 需要用户确认的危险工具
+DANGEROUS_TOOLS = {
+    "delete_file",
+    "write_file",  # 覆盖文件
+    "run_shell",   # 执行命令
+}
+
+
+class CodeMateAgent:
+    """
+    CodeMate Agent
+
+    使用原生 Function Calling 进行代码分析的 AI Agent。
+
+    工作流程示例：
+        用户: "这个项目有哪些文件？"
+        LLM: [tool_call: list_dir(path=".")]
+        Agent: 执行 list_dir → 返回文件列表
+        LLM: "这个项目包含 main.py, config.py..."
+    """
+
+    # 系统提示词：定义 Agent 的角色和行为
+    SYSTEM_PROMPT = """你是 CodeMate，一个专业的代码分析助手。
+
+你的任务是帮助开发者理解、分析和改进代码。
+
+## 工作方式
+1. 仔细分析用户的问题
+2. 使用合适的工具获取信息
+3. 基于工具返回的结果给出准确答案
+
+## 注意事项
+- 在给出最终答案前，确保已收集足够的信息
+- 如果工具执行失败，尝试其他方法
+- 保持回答简洁专业
+
+## 工具调用注意事项
+- 参数必须是实际值，不能是类型名称（如 'str', 'int', 'list', 'dict'）
+- file_path 必须是完整的文件路径字符串
+- content 必须是实际要写入的内容，不能是类型名称
+- 如果工具调用返回错误，请仔细阅读错误信息并更正参数后重试
+
+## 子代理使用指南
+- 使用 task 工具将复杂任务委托给子代理
+- 需要多步探索时，优先使用 subagent_type="explore"
+- 简单任务直接处理，不要过度使用子代理"""
+
+    def __init__(
+        self,
+        llm_client: GLMClient,
+        tools: List[Tool],
+        max_rounds: int = 50,
+        workspace_dir: str = ".",
+        confirm_callback: Optional[Callable[[str, dict], bool]] = None,
+        trace_logger: Optional[TraceLogger] = None,
+        metrics: Optional[SessionMetrics] = None,
+        session_storage: Optional[SessionStorage] = None,
+        memory_manager: Optional[MemoryManager] = None,
+        compression_enabled: bool = True,
+        compression_config: Optional[CompressionConfig] = None,
+        planning_enabled: bool = True,
+        plan_display_callback: Optional[Callable[[str], None]] = None,
+        progress_callback: Optional[Callable[[str, dict], None]] = None,
+        light_llm_client: Optional[GLMClient] = None,
+    ):
+        """
+        初始化 Agent
+
+        Args:
+            llm_client: LLM 客户端，用于调用 GLM API
+            tools: 工具列表，Agent 可以使用的所有工具
+            max_rounds: 最大交互轮数，防止无限循环
+            workspace_dir: 工作目录，工具将在此目录下操作
+            confirm_callback: 用户确认回调函数，接收 (tool_name, arguments)，返回是否同意
+            trace_logger: Trace 轨迹日志记录器（可选）
+            metrics: 会话指标统计（可选）
+            session_storage: 会话持久化存储（可选）
+            memory_manager: 长期记忆管理器（可选）
+            compression_enabled: 是否启用上下文压缩（默认 True）
+            compression_config: 压缩配置（可选）
+            planning_enabled: 是否启用任务规划功能（默认 True）
+            plan_display_callback: 计划显示回调函数，用于显示执行计划（可选）
+            progress_callback: 进度回调函数，接收 (event, data)，用于实时显示进度（可选）
+            light_llm_client: 轻量模型客户端，用于子代理的简单任务（可选，默认使用主模型）
+        """
+        self.llm = llm_client                    # LLM 客户端
+        self.light_llm = light_llm_client        # 轻量模型客户端
+        self.max_rounds = max_rounds              # 最大轮数限制
+        self.workspace_dir = Path(workspace_dir) # 当前工作目录
+        self.confirm_callback = confirm_callback  # 用户确认回调
+        self.plan_display_callback = plan_display_callback  # 计划显示回调
+        self.progress_callback = progress_callback  # 进度回调
+
+        # 日志系统
+        self.logger = setup_logger("codemate.agent")
+        self.trace_logger = trace_logger
+        self.metrics = metrics
+
+        # 持久化系统
+        self.session_storage = session_storage
+        self.memory_manager = memory_manager
+
+        # 上下文压缩
+        self.compression_enabled = compression_enabled
+        if compression_enabled:
+            self.compressor = ContextCompressor(
+                config=compression_config or CompressionConfig.from_env(),
+                llm_client=llm_client,
+            )
+        else:
+            self.compressor = None
+
+        # 工具输出截断器
+        self.truncator = ObservationTruncator()
+
+        # 上一次 API 调用的 token 数（用于压缩判断）
+        self._last_usage_tokens = 0
+        # 上一次 API 报告的累计 token 数（用于检测累计值）
+        self._last_reported_total_tokens = 0
+        # 用于检测循环：最近 N 次工具调用的签名
+        self._recent_tool_calls: list[str] = []
+        self._max_recent_calls = 10  # 保留最近 10 次调用记录
+        self._loop_count = 0  # 循环检测计数器
+
+        # todo 进度跟踪
+        self._todo_all_completed = False  # 所有 todo 是否完成
+        self._last_completed_count = 0  # 最近一次完成的任务数
+
+        # 工具注册：将所有工具注册到注册器中
+        # 这样可以通过工具名称快速查找和执行工具
+        self.tool_registry = ToolRegistry()
+        for tool in tools:
+            self.tool_registry.register(tool)
+
+        # 任务规划器
+        self.planning_enabled = planning_enabled
+        if planning_enabled:
+            self.planner = TaskPlanner(
+                llm_client=llm_client,
+                enabled=True,
+                auto_planning=True,
+            )
+        else:
+            self.planner = None
+
+        # Task 工具：用于委托子代理
+        # 需要注入依赖（llm_client, tool_registry, 以及可选的 light_llm_client）
+        self.task_tool = TaskTool(working_dir=str(self.workspace_dir))
+        self.task_tool.set_dependencies(
+            main_llm_client=llm_client,
+            tool_registry=self.tool_registry,
+            light_llm_client=light_llm_client,
+        )
+        # 注册 Task 工具
+        self.tool_registry.register(self.task_tool)
+
+        # 消息历史：存储整个对话过程
+        # 第一条消息始终是 system 角色的系统提示词
+        self.messages: List[Message] = [
+            Message(role="system", content=self._get_system_prompt())
+        ]
+
+        # 统计信息
+        self.round_count = 0      # 当前对话轮数
+        self.total_tokens = 0     # 累计消耗的 token 数
+
+    def run(self, query: str) -> str:
+        """
+        运行 Agent - 这是核心方法
+
+        执行完整的 Agent 循环，直到获得最终答案或达到最大轮数。
+
+        Args:
+            query: 用户的查询问题
+
+        Returns:
+            str: Agent 的最终答案
+
+        执行流程：
+        ┌─────────────────────────────────────────────────────────────┐
+        │ 1. 添加用户消息到历史                                       │
+        │ 2. 调用 LLM（带上工具列表）                                │
+        │ 3. 检查响应是否包含 tool_calls                             │
+        │    ├─ 是：执行所有工具，将结果发回 LLM，回到步骤 2         │
+        │    └─ 否：返回 content 作为最终答案                        │
+        │ 4. 重复直到有答案或达到最大轮数                            │
+        └─────────────────────────────────────────────────────────────┘
+        """
+        # 记录用户输入
+        self.logger.info(f"用户输入: {query[:100]}...")
+        if self.trace_logger:
+            self.trace_logger.log_event(
+                TraceEventType.USER_INPUT,
+                {"text": query, "length": len(query)},
+                step=0,
+            )
+        if self.metrics:
+            self.metrics.record_round()
+
+        # 保存到持久化存储
+        if self.session_storage:
+            self.session_storage.add_user_message(query)
+
+        # 步骤 0: 检查是否需要压缩上下文
+        if self.compression_enabled and self.compressor:
+            if self.compressor.should_compress(
+                self.messages,
+                self.total_tokens,  # 使用累计 token 数而非单次请求 token 数
+                query,
+            ):
+                self.logger.info("上下文过长，正在压缩...")
+                old_count = len(self.messages)
+                self.messages = self.compressor.compress(self.messages)
+                self.logger.info(f"上下文压缩完成: {old_count} → {len(self.messages)} 条消息")
+
+                # 记录压缩事件
+                if self.trace_logger:
+                    self.trace_logger.log_event(
+                        TraceEventType.INFO,
+                        {"event": "context_compressed", "before": old_count, "after": len(self.messages)},
+                    )
+
+        # 步骤 0.5: 检查是否需要任务规划
+        # 在添加用户消息之前检查，避免规划结果被重复添加
+        planning_result = None
+        if self.planning_enabled and self.planner:
+            if self.planner.needs_planning(query):
+                self.logger.info("检测到复杂任务，正在生成执行计划...")
+                plan = self.planner.generate_plan(query)
+                if plan:
+                    planning_result = plan
+                    # 记录规划事件
+                    if self.trace_logger:
+                        self.trace_logger.log_event(
+                            TraceEventType.INFO,
+                            {"event": "task_planned", "summary": plan.summary, "steps": len(plan.steps)},
+                        )
+                    # 自动执行 TodoWrite 工具创建计划
+                    try:
+                        todo_result = self.tool_registry.execute(
+                            "todo_write",
+                            **plan.to_todo_params()
+                        )
+                        self.logger.info(f"执行计划已创建: {plan.summary}")
+
+                        # 调用计划显示回调（在 CLI 中显示）
+                        if self.plan_display_callback:
+                            self.plan_display_callback(todo_result)
+
+                        # 将 TodoWrite 结果添加到消息历史
+                        self.messages.append(Message(role="system", content=f"""
+# 执行计划
+
+{todo_result}
+
+请按照上述计划逐步完成任务。完成每个步骤后，使用 TodoWrite 工具更新步骤状态。
+"""))
+                    except Exception as e:
+                        self.logger.warning(f"创建执行计划失败: {e}")
+
+        # 步骤 1: 将用户输入添加到消息历史
+        self.messages.append(Message(role="user", content=query))
+        self.round_count = 0
+
+        # 获取所有工具的 OpenAI Schema 格式
+        # LLM 需要知道有哪些工具可用，以及每个工具的参数格式
+        tools = [t.to_openai_schema() for t in self.tool_registry.get_all().values()]
+
+        # 步骤 2-4: 主循环
+        while self.round_count < self.max_rounds:
+            self.round_count += 1
+            if self.metrics:
+                self.metrics.record_round()
+
+            # 触发轮次开始事件
+            self._emit_progress("round_start", {
+                "round": self.round_count,
+                "max_rounds": self.max_rounds,
+            })
+
+            # 检查 todo 是否全部完成，如果是则添加提示
+            if self._todo_all_completed and not hasattr(self, '_completion_hint_sent'):
+                self.messages.append(Message(
+                    role="system",
+                    content="所有计划的任务已完成。请给出最终总结，不要继续执行其他操作。"
+                ))
+                self._completion_hint_sent = True
+                self.logger.info("已发送完成提示，等待 LLM 给出最终答案")
+
+            # 调用 LLM，传入：
+            # - messages: 完整的对话历史
+            # - tools: 可用工具列表（OpenAI Function Calling 格式）
+            start_time = time.time()
+
+            # 记录 LLM 请求
+            if self.trace_logger:
+                self.trace_logger.log_event(
+                    TraceEventType.LLM_REQUEST,
+                    {
+                        "model": self.llm.model,
+                        "messages_count": len(self.messages),
+                        "tools_count": len(tools),
+                    },
+                    step=self.round_count,
+                )
+
+            response: LLMResponse = self.llm.complete(
+                messages=self.messages,
+                tools=tools,
+            )
+
+            duration_ms = (time.time() - start_time) * 1000
+
+            # 更新 token 统计（用于成本控制）
+            if response.usage:
+                reported_total = response.usage.total_tokens
+
+                # 检查 token 数是否合理（单次请求通常不应超过 15000）
+                # GLM API 有时返回累计值而非单次值
+                SINGLE_REQUEST_TOKEN_LIMIT = 15000
+                if reported_total > SINGLE_REQUEST_TOKEN_LIMIT:
+                    # 检测到累计值，计算差值
+                    if self._last_reported_total_tokens > 0:
+                        actual_tokens = reported_total - self._last_reported_total_tokens
+                        self._last_usage_tokens = actual_tokens
+                        self.total_tokens += actual_tokens
+                        self.logger.debug(
+                            f"检测到累计 token，计算差值: {reported_total} - {self._last_reported_total_tokens} = {actual_tokens}"
+                        )
+                    else:
+                        # 第一次调用，使用估算值
+                        estimated_tokens = len(str(response.content)) // 3 + 1000
+                        self._last_usage_tokens = estimated_tokens
+                        self.total_tokens += estimated_tokens
+                        self.logger.warning(
+                            f"首次检测到高 token 数，使用估算值: {estimated_tokens}"
+                        )
+                    self._last_reported_total_tokens = reported_total
+                else:
+                    # 正常值，直接使用
+                    # 但也要检查是否比上次报告的值还小（说明 API 重置了累计）
+                    if self._last_reported_total_tokens > 0 and reported_total < self._last_reported_total_tokens:
+                        # API 重置了累计值，从本次开始重新跟踪
+                        self._last_reported_total_tokens = 0
+                        self.logger.info("检测到 token 计数重置，重新开始累计跟踪")
+
+                    self.total_tokens += reported_total
+                    self._last_usage_tokens = reported_total
+
+                    # 如果是合理的累计值，也记录下来
+                    if reported_total > SINGLE_REQUEST_TOKEN_LIMIT // 2:
+                        self._last_reported_total_tokens = reported_total
+
+                # 记录到 metrics
+                if self.metrics:
+                    self.metrics.record_llm_call(response.usage, duration_ms)
+
+            # 记录 LLM 响应
+            if self.trace_logger:
+                self.trace_logger.log_event(
+                    TraceEventType.LLM_RESPONSE,
+                    {
+                        "content": response.content[:200] if response.content else "",
+                        "tool_calls_count": len(response.tool_calls) if response.tool_calls else 0,
+                        "usage": response.usage.model_dump() if response.usage else None,
+                        "duration_ms": round(duration_ms, 2),
+                    },
+                    step=self.round_count,
+                )
+
+            # 将 LLM 的响应添加到消息历史
+            # 注意：assistant 消息可能包含 content 和 tool_calls
+            assistant_msg = Message(
+                role="assistant",
+                content=response.content,
+                tool_calls=response.tool_calls
+            )
+            self.messages.append(assistant_msg)
+
+            # 步骤 3: 检查 LLM 是否请求调用工具
+            if response.tool_calls:
+                self.logger.debug(f"LLM 请求调用 {len(response.tool_calls)} 个工具")
+
+                # 检测循环：记录本次工具调用
+                for tool_call in response.tool_calls:
+                    tool_name = tool_call.function.name
+                    arguments = tool_call.function.arguments
+                    # 生成调用签名（工具名 + 主要参数）
+                    try:
+                        call_signature = self._get_tool_call_signature(tool_name, arguments)
+                        self._recent_tool_calls.append(call_signature)
+                        if len(self._recent_tool_calls) > self._max_recent_calls:
+                            self._recent_tool_calls.pop(0)
+                    except Exception as e:
+                        self.logger.warning(f"签名生成失败: {e}")
+                        self._recent_tool_calls.append(f"{tool_name}|error")
+
+                # 检测是否陷入循环
+                try:
+                    if self._is_stuck_in_loop():
+                        loop_count = getattr(self, '_loop_count', 0) + 1
+                        self._loop_count = loop_count
+
+                        loop_warning = (
+                            f"检测到 Agent 陷入循环（第 {loop_count} 次，最近 {self._max_recent_calls} 次调用有重复模式）。"
+                        )
+
+                        if loop_count >= 3:
+                            # 强制打破循环
+                            loop_warning += " 采取强制措施打破循环。"
+                            self.logger.warning(loop_warning)
+
+                            # 清空最近的调用记录
+                            self._recent_tool_calls = []
+                            self._loop_count = 0
+
+                            # 添加强制干预消息
+                            self.messages.append(Message(
+                                role="system",
+                                content="""严重警告：已连续 3 次检测到工具调用循环。请立即停止当前尝试的方法。
+
+当前策略明显无效，请：
+1. 向用户说明当前遇到的问题
+2. 询问用户是否有其他建议
+3. 或者尝试完全不同的方法
+
+不要再重复相同的工具调用！"""
+                            ))
+
+                            if self.trace_logger:
+                                self.trace_logger.log_event(
+                                    TraceEventType.WARNING,
+                                    {"message": loop_warning, "action": "forced_break", "recent_calls": self._recent_tool_calls},
+                                    step=self.round_count,
+                                )
+                        else:
+                            self.logger.warning(loop_warning)
+                            if self.trace_logger:
+                                self.trace_logger.log_event(
+                                    TraceEventType.WARNING,
+                                    {"message": loop_warning, "recent_calls": self._recent_tool_calls},
+                                    step=self.round_count,
+                                )
+                            # 添加警告消息
+                            self.messages.append(Message(
+                                role="system",
+                                content=f"警告：检测到重复的工具调用模式（第 {loop_count} 次）。请重新评估当前状态，尝试不同的方法。"
+                            ))
+                except Exception as e:
+                    self.logger.error(f"循环检测出错: {e}")
+                    # 清空历史以防止持续出错
+                    self._recent_tool_calls = []
+
+                # LLM 请求调用工具，执行所有工具调用
+                for tool_call in response.tool_calls:
+                    tool_name = tool_call.function.name
+                    arguments = tool_call.function.arguments
+
+                    # 触发工具调用开始事件
+                    self._emit_progress("tool_call_start", {
+                        "tool": tool_name,
+                        "args": self._format_args_for_display(arguments),
+                    })
+
+                    result = self._execute_tool_call(tool_call)
+
+                    # 检查 todo 完成状态
+                    if tool_name == "todo_write" and self._check_todo_completion(result):
+                        self._todo_all_completed = True
+                        self.logger.info("检测到所有 todo 任务已完成")
+
+                    # 触发工具调用完成事件
+                    self._emit_progress("tool_call_end", {
+                        "tool": tool_name,
+                        "success": not ("失败" in result or "错误" in result)
+                    })
+
+                    # 将工具执行结果添加到消息历史
+                    # role="tool" 表示这是工具返回的结果
+                    # tool_call_id 用于关联到对应的工具调用
+                    self.messages.append(Message(
+                        role="tool",
+                        content=result,
+                        tool_call_id=tool_call.id,
+                        name=tool_call.function.name
+                    ))
+                # 工具结果已添加，继续循环，让 LLM 处理工具结果
+            else:
+                # 没有工具调用，说明 LLM 已经给出最终答案
+                self.logger.info(f"任务完成，共 {self.round_count} 轮")
+
+                # 保存助手回答到持久化存储
+                if self.session_storage:
+                    self.session_storage.add_assistant_message(response.content or "")
+                    self.session_storage.update_metadata(total_tokens=self.total_tokens)
+
+                    # 自动生成会话摘要
+                    try:
+                        self.session_storage.generate_summary(self.llm, response.content or "")
+                        self.logger.info("会话摘要已生成")
+                    except Exception as e:
+                        self.logger.warning(f"摘要生成失败: {e}")
+
+                # 记录会话结束
+                if self.trace_logger:
+                    self.trace_logger.log_event(
+                        TraceEventType.SESSION_END,
+                        {
+                            "final_answer": response.content[:500],
+                            "total_rounds": self.round_count,
+                        },
+                        step=self.round_count,
+                    )
+
+                return response.content
+
+        # 达到最大轮数仍未完成任务
+        self.logger.warning(f"达到最大轮数 ({self.max_rounds})")
+        if self.trace_logger:
+            self.trace_logger.log_event(
+                TraceEventType.WARNING,
+                {"message": f"达到最大轮数 ({self.max_rounds})，任务未完成"},
+                step=self.round_count,
+            )
+        return f"已达到最大轮数 ({self.max_rounds})，无法完成任务。"
+
+    def _execute_tool_call(self, tool_call: ToolCall) -> str:
+        """
+        执行单个工具调用
+
+        Args:
+            tool_call: 工具调用信息，包含工具名和参数
+
+        Returns:
+            str: 工具执行的结果（字符串形式）
+
+        错误处理：
+        - 如果工具不存在或执行失败，返回错误信息
+        - 错误信息会被发送给 LLM，LLM 可能会尝试其他方法
+
+        确认机制：
+        - 危险工具（delete_file, write_file, run_shell）需要用户确认
+        - 如果用户拒绝，返回取消信息
+        """
+        tool_name = tool_call.function.name      # 工具名称，如 "read_file"
+        arguments = tool_call.function.arguments # 工具参数，如 {"file_path": "main.py"}
+
+        # 参数验证：检测可疑的参数值（GLM API 有时会返回类型名称而非实际值）
+        validation_error = self._validate_arguments(tool_name, arguments)
+        if validation_error:
+            self.logger.warning(f"参数验证失败: {validation_error}")
+            # 增强错误消息，包含工具正确用法示例
+            tool = self.tool_registry.get(tool_name)
+            if tool:
+                usage_hint = self._get_tool_usage_hint(tool_name, tool)
+                return f"错误: {validation_error}\n\n{usage_hint}"
+            return f"错误: {validation_error}。请提供正确的参数值。"
+
+        # 记录工具调用开始
+        self.logger.debug(f"执行工具: {tool_name}")
+        if self.trace_logger:
+            self.trace_logger.log_event(
+                TraceEventType.TOOL_CALL,
+                {
+                    "tool": tool_name,
+                    "arguments": arguments,
+                },
+                step=self.round_count,
+            )
+
+        # 检查是否需要用户确认
+        if tool_name in DANGEROUS_TOOLS and self.confirm_callback is not None:
+            # 调用确认回调，询问用户是否同意执行
+            approved = self.confirm_callback(tool_name, arguments)
+            if not approved:
+                # 用户取消操作
+                result = f"用户取消了操作: {tool_name}"
+
+                if self.trace_logger:
+                    self.trace_logger.log_event(
+                        TraceEventType.USER_CONFIRM,
+                        {"tool": tool_name, "approved": False},
+                        step=self.round_count,
+                    )
+
+                if self.metrics:
+                    self.metrics.record_tool_call(tool_name, success=False)
+
+                return result
+
+            if self.trace_logger:
+                self.trace_logger.log_event(
+                    TraceEventType.USER_CONFIRM,
+                    {"tool": tool_name, "approved": True},
+                    step=self.round_count,
+                )
+
+        try:
+            # 通过工具注册器执行工具
+            # 注册器会根据工具名称找到对应的工具实例并执行
+            result = self.tool_registry.execute(tool_name, **arguments)
+
+            # 截断过长的工具输出
+            if not self.truncator.should_skip_truncation(tool_name):
+                original_length = len(str(result))
+                result = self.truncator.truncate(str(result), tool_name)
+                if len(result) < original_length:
+                    self.logger.info(f"{tool_name} 输出已截断: {original_length} → {len(result)} 字符")
+
+            # 记录工具执行成功
+            if self.trace_logger:
+                self.trace_logger.log_event(
+                    TraceEventType.TOOL_RESULT,
+                    {
+                        "tool": tool_name,
+                        "result": str(result)[:500],  # 限制长度
+                        "success": True,
+                    },
+                    step=self.round_count,
+                )
+
+            if self.metrics:
+                self.metrics.record_tool_call(tool_name, success=True)
+
+            return result
+
+        except Exception as e:
+            # 工具执行失败，返回错误信息给 LLM
+            # LLM 可以根据错误信息决定是否重试或使用其他方法
+            error_msg = f"工具执行失败: {e}"
+
+            # 记录错误
+            self.logger.error(f"{tool_name} 执行失败: {e}")
+
+            if self.trace_logger:
+                self.trace_logger.log_event(
+                    TraceEventType.TOOL_ERROR,
+                    {
+                        "tool": tool_name,
+                        "error": str(e),
+                        "error_type": type(e).__name__,
+                    },
+                    step=self.round_count,
+                )
+
+            if self.metrics:
+                self.metrics.record_tool_call(tool_name, success=False)
+                self.metrics.record_error()
+
+            return error_msg
+
+    def _get_system_prompt(self) -> str:
+        """
+        获取完整的系统提示词
+
+        系统提示词包括：
+        1. 基础提示词（SYSTEM_PROMPT）：定义 Agent 的角色
+        2. 长期记忆（如果有）：用户偏好、项目上下文等
+        3. 工具列表：告诉 LLM 有哪些工具可用
+
+        Returns:
+            str: 完整的系统提示词
+        """
+        prompt_parts = [self.SYSTEM_PROMPT]
+
+        # 添加长期记忆
+        if self.memory_manager:
+            memory = self.memory_manager.load_all_memory()
+            if memory.strip() and not memory.startswith("# 长期记忆\n\n暂无"):
+                prompt_parts.append(f"\n## 长期记忆\n{memory}")
+
+        # 获取所有工具的描述信息
+        tools_desc = self.tool_registry.get_tools_description()
+        prompt_parts.append(f"\n## 可用工具\n{tools_desc}")
+
+        return "\n".join(prompt_parts)
+
+    def reset(self):
+        """
+        重置 Agent 状态
+
+        用于开始新的对话，清空消息历史和统计信息。
+        但保留工具配置。
+        """
+        self.messages = [Message(role="system", content=self._get_system_prompt())]
+        self.round_count = 0
+        self.total_tokens = 0
+        self._last_usage_tokens = 0
+        self._last_reported_total_tokens = 0
+        self._recent_tool_calls = []
+        self._loop_count = 0  # 重置循环计数器
+        # 重置规划器
+        if self.planner:
+            self.planner.reset()
+
+    def get_stats(self) -> dict:
+        """
+        获取 Agent 统计信息
+
+        用于监控和调试，了解 Agent 的运行情况。
+
+        Returns:
+            dict: 包含 round_count, total_tokens, message_count
+        """
+        return {
+            "round_count": self.round_count,          # 对话轮数
+            "total_tokens": self.total_tokens,        # 累计 token 消耗
+            "message_count": len(self.messages),      # 消息总数
+        }
+
+    def load_session(self, messages: list[dict]) -> None:
+        """
+        加载历史会话消息
+
+        从持久化存储加载历史消息，恢复对话上下文。
+
+        Args:
+            messages: 历史消息列表（字典格式）
+
+        注意：
+            - 会清空当前消息历史
+            - 第一条消息始终是 system 提示词
+            - 历史消息会追加到 system 消息之后
+        """
+        # 重置为初始状态（只有 system 消息）
+        self.messages = [Message(role="system", content=self._get_system_prompt())]
+
+        # 加载历史消息
+        for msg_dict in messages:
+            role = msg_dict.get("role")
+            content = msg_dict.get("content", "")
+
+            if role == "tool":
+                # 工具消息需要特殊处理
+                self.messages.append(Message(
+                    role="tool",
+                    content=content,
+                    tool_call_id=msg_dict.get("tool_call_id", ""),
+                    name=msg_dict.get("name", ""),
+                ))
+            elif role in ("user", "assistant", "system"):
+                # 普通消息
+                self.messages.append(Message(role=role, content=content))
+
+        self.logger.info(f"已加载 {len(self.messages) - 1} 条历史消息")
+
+    def _emit_progress(self, event: str, data: dict) -> None:
+        """
+        触发进度回调
+
+        Args:
+            event: 事件类型 (round_start, tool_call_start, tool_call_end, etc.)
+            data: 事件数据
+        """
+        if self.progress_callback:
+            try:
+                self.progress_callback(event, data)
+            except Exception as e:
+                # 回调异常不应影响主流程
+                self.logger.debug(f"进度回调异常: {e}")
+
+    def _format_args_for_display(self, arguments: dict) -> str:
+        """
+        格式化工具参数用于显示
+
+        Args:
+            arguments: 工具参数字典
+
+        Returns:
+            格式化后的参数字符串
+        """
+        if not arguments:
+            return ""
+
+        # 根据参数类型优化显示
+        if "file_path" in arguments:
+            file_path = arguments.get("file_path", "")
+            return f"file={file_path}"
+        elif "command" in arguments:
+            cmd = arguments.get("command", "")
+            return f"cmd={cmd[:50]}..." if len(cmd) > 50 else f"cmd={cmd}"
+        elif "prompt" in arguments:
+            # task 工具的特殊处理
+            return f"description={arguments.get('description', '')[:30]}"
+        elif "pattern" in arguments:
+            # search_files 工具
+            return f"pattern={arguments.get('pattern', '')}"
+        elif "path" in arguments:
+            return f"path={arguments.get('path', '')}"
+
+        # 通用格式化
+        parts = []
+        for k, v in list(arguments.items())[:3]:  # 最多显示 3 个参数
+            v_str = str(v)
+            if len(v_str) > 30:
+                v_str = v_str[:27] + "..."
+            parts.append(f"{k}={v_str}")
+        return ", ".join(parts)
+
+    def _get_tool_call_signature(self, tool_name: str, arguments: dict) -> str:
+        """
+        生成工具调用的唯一签名
+
+        用于检测重复的调用模式。
+
+        Args:
+            tool_name: 工具名称
+            arguments: 工具参数
+
+        Returns:
+            调用签名字符串
+        """
+        # 提取关键参数
+        key_parts = [tool_name]
+
+        # 如果 arguments 不是 dict，返回简单签名
+        if not isinstance(arguments, dict):
+            self.logger.warning(f"arguments 不是 dict: {type(arguments).__name__}")
+            return f"{tool_name}|invalid_args"
+
+        try:
+            # 对于文件操作，文件路径是关键
+            if "file_path" in arguments:
+                value = arguments["file_path"]
+                # 处理各种可能的类型
+                if isinstance(value, list):
+                    value_str = f"[list:{len(value)}]"
+                elif isinstance(value, dict):
+                    value_str = "[dict]"
+                else:
+                    value_str = str(value)[:100]
+                key_parts.append(value_str)
+            elif "path" in arguments:
+                value = arguments["path"]
+                if isinstance(value, list):
+                    value_str = f"[list:{len(value)}]"
+                elif isinstance(value, dict):
+                    value_str = "[dict]"
+                else:
+                    value_str = str(value)[:100]
+                key_parts.append(value_str)
+            elif "command" in arguments:
+                # 对于 shell 命令，取前 50 个字符
+                cmd = arguments["command"]
+                if isinstance(cmd, str):
+                    key_parts.append(cmd[:50] if len(cmd) > 50 else cmd)
+                else:
+                    key_parts.append(str(cmd)[:50])
+            elif "todos" in arguments:
+                # todo_write 工具的特殊处理
+                todos = arguments["todos"]
+                if isinstance(todos, list):
+                    key_parts.append(f"todos:{len(todos)}")
+                else:
+                    key_parts.append(f"todos:invalid")
+            else:
+                # 使用参数的哈希值 - 先转换为字符串避免比较问题
+                try:
+                    items_str = str(list(arguments.keys()))
+                    key_parts.append(items_str[:50])
+                except Exception:
+                    key_parts.append("unknown")
+
+            return "|".join(key_parts)
+        except Exception as e:
+            # 如果签名生成失败，返回一个简单的签名
+            self.logger.warning(f"签名生成失败 [{tool_name}]: {e}")
+            return f"{tool_name}|error"
+
+    def _is_stuck_in_loop(self) -> bool:
+        """
+        检测 Agent 是否陷入循环
+
+        通过分析最近的工具调用模式，检测是否有重复行为。
+
+        Returns:
+            是否陷入循环
+        """
+        if len(self._recent_tool_calls) < 5:
+            return False
+
+        # 检查最近 5 次调用中是否有 3 次以上相同
+        recent = self._recent_tool_calls[-5:]
+
+        # 确保所有元素都是字符串（可以 hash）
+        str_recent = [str(call) for call in recent]
+        unique_count = len(set(str_recent))
+        if unique_count <= 2:
+            # 只有 1-2 种不同的调用，可能陷入循环
+            return True
+
+        # 检查是否有交替模式（A-B-A-B-A）
+        if len(str_recent) >= 5:
+            if str_recent[0] == str_recent[2] == str_recent[4] and str_recent[1] == str_recent[3]:
+                return True
+
+        return False
+
+    def _validate_arguments(self, tool_name: str, arguments: dict) -> Optional[str]:
+        """
+        验证工具参数
+        
+        使用统一的 ArgumentValidator 模块进行验证。
+
+        Args:
+            tool_name: 工具名称
+            arguments: 参数字典
+
+        Returns:
+            错误信息，如果验证通过则返回 None
+        """
+        return ArgumentValidator.validate(tool_name, arguments)
+
+    def _get_tool_usage_hint(self, tool_name: str, tool) -> str:
+        """
+        获取工具使用提示
+
+        当参数验证失败时，提供清晰的使用示例帮助 LLM 纠正调用。
+
+        Args:
+            tool_name: 工具名称
+            tool: 工具实例
+
+        Returns:
+            使用提示字符串
+        """
+        hints = {
+            "write_file": "write_file 使用方法:\n"
+                          "- file_path: 完整文件路径，如 'src/main.py' 或 'codemate_agent/agent/agent.py'\n"
+                          "- content: 要写入的实际文件内容（字符串格式）\n"
+                          "示例: write_file(file_path='myfile.py', content='print(\"hello\")')",
+            "read_file": "read_file 使用方法:\n"
+                         "- file_path: 完整文件路径\n"
+                         "示例: read_file(file_path='src/main.py')",
+            "search_code": "search_code 使用方法:\n"
+                           "- pattern: 搜索模式（字符串）\n"
+                           "示例: search_code(pattern='def hello')",
+        }
+
+        if tool_name in hints:
+            return hints[tool_name]
+
+        # 通用提示
+        params = tool.parameters.get("properties", {})
+        required = tool.parameters.get("required", [])
+
+        hint_parts = [f"{tool_name} 参数:"]
+        for param_name in required:
+            param_info = params.get(param_name, {})
+            param_desc = param_info.get("description", "无描述")
+            hint_parts.append(f"- {param_name}: {param_desc}")
+
+        return "\n".join(hint_parts)
+
+    def _check_todo_completion(self, tool_result: str) -> bool:
+        """
+        检查 todo_write 结果是否全部完成
+
+        Args:
+            tool_result: todo_write 工具返回的字符串
+
+        Returns:
+            是否全部完成
+        """
+        import re
+
+        # 解析格式: "--- [3/3] 完成 ---"
+        match = re.search(r'\[(\d+)/(\d+)\]\s*完成', tool_result)
+        if match:
+            completed = int(match.group(1))
+            total = int(match.group(2))
+            return completed == total and total > 0
+
+        # 检查是否所有任务都有 [✓] 图标
+        lines = tool_result.split('\n')
+        todo_lines = [
+            l for l in lines
+            if l.strip().startswith('[✓]') or
+               l.strip().startswith('[▶]') or
+               l.strip().startswith('[ ]')
+        ]
+        if todo_lines and all('[✓]' in line for line in todo_lines):
+            return len(todo_lines) > 0
+
+        return False
+
+
+# 保留旧的 ReActAgent 类名作为别名
+# 这样可以兼容旧代码，同时使用新的 Function Calling Agent
+ReActAgent = CodeMateAgent

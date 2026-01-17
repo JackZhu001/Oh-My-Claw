@@ -1,0 +1,47 @@
+{
+  "timestamp": "2026-01-17T20:06:57.174497",
+  "total_issues": 4,
+  "issues": [
+    {
+      "file_path": "tests/test_example.py",
+      "issue_type": "long_function",
+      "severity": "high",
+      "line_number": 6,
+      "description": "函数过长，难以理解和维护",
+      "suggestion": "将函数拆分为多个更小的函数，每个函数只做一件事\n其他建议: 提取重复的代码块为独立函数; 使用策略模式或命令模式替代长函数; 考虑使用类来封装相关的数据和操作",
+      "code_snippet": null
+    },
+    {
+      "file_path": "tests/test_example.py",
+      "issue_type": "high_complexity",
+      "severity": "high",
+      "line_number": 6,
+      "description": "圈复杂度过高，逻辑过于复杂",
+      "suggestion": "使用卫语句(Guard Clauses)减少嵌套层级\n其他建议: 提取复杂条件为独立的判断函数; 使用多态替代复杂的条件判断; 将复杂的布尔表达式拆分为多个有意义的变量",
+      "code_snippet": null
+    },
+    {
+      "file_path": "tests/test_example.py",
+      "issue_type": "deep_nesting",
+      "severity": "high",
+      "line_number": 6,
+      "description": "嵌套层级过深，代码可读性差",
+      "suggestion": "使用卫语句提前返回\n其他建议: 提取嵌套代码为独立函数; 使用多态替代条件判断; 考虑使用状态模式",
+      "code_snippet": null
+    },
+    {
+      "file_path": "tests/test_example.py",
+      "issue_type": "duplicate_code",
+      "severity": "high",
+      "line_number": 75,
+      "description": "存在重复代码，维护成本高",
+      "suggestion": "提取重复代码为独立函数\n其他建议: 使用模板方法模式; 考虑使用继承或组合来共享代码; 将重复逻辑抽象为工具函数",
+      "code_snippet": null
+    }
+  ],
+  "summary": {
+    "high": 4,
+    "medium": 0,
+    "low": 0
+  }
+}
