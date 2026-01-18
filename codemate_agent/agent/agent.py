@@ -31,6 +31,7 @@ from codemate_agent.context import ContextCompressor, CompressionConfig, Observa
 from codemate_agent.planner import TaskPlanner
 from codemate_agent.subagent import TaskTool
 from codemate_agent.validation import ArgumentValidator
+from codemate_agent.skill import SkillManager
 
 
 # 需要用户确认的危险工具
@@ -178,6 +179,9 @@ class CodeMateAgent:
         else:
             self.planner = None
 
+        # Skill 管理器（渐进式加载）
+        self.skill_manager = SkillManager()
+
         # Task 工具：用于委托子代理
         # 需要注入依赖（llm_client, tool_registry, 以及可选的 light_llm_client）
         self.task_tool = TaskTool(working_dir=str(self.workspace_dir))
@@ -221,6 +225,13 @@ class CodeMateAgent:
         │ 4. 重复直到有答案或达到最大轮数                            │
         └─────────────────────────────────────────────────────────────┘
         """
+        # 步骤 -1: 检查是否是 skill 命令
+        if query.startswith("/"):
+            skill_result = self._handle_skill_command(query)
+            if skill_result is not None:
+                # skill 命令已处理，将 skill prompt 注入后继续执行
+                query = skill_result
+
         # 记录用户输入
         self.logger.info(f"用户输入: {query[:100]}...")
         if self.trace_logger:
@@ -411,6 +422,27 @@ class CodeMateAgent:
                 tool_calls=response.tool_calls
             )
             self.messages.append(assistant_msg)
+
+            # 步骤 2.5: 检测 LLM 是否声明使用 Skill
+            if response.content and not hasattr(self, '_skill_injected'):
+                skill_match = self._detect_skill_declaration(response.content)
+                if skill_match:
+                    skill_name = skill_match
+                    skill_prompt = self.skill_manager.prepare_execution(skill_name, query)
+                    if skill_prompt:
+                        self.logger.info(f"检测到 Skill 声明: {skill_name}，注入完整内容")
+                        # 注入 skill 完整内容作为 system 消息
+                        self.messages.append(Message(
+                            role="system",
+                            content=f"## Skill 指令: {skill_name}\n\n{skill_prompt}"
+                        ))
+                        self._skill_injected = True
+                        if self.trace_logger:
+                            self.trace_logger.log_event(
+                                TraceEventType.INFO,
+                                {"event": "skill_auto_triggered", "skill": skill_name},
+                                step=self.round_count,
+                            )
 
             # 步骤 3: 检查 LLM 是否请求调用工具
             if response.tool_calls:
@@ -691,7 +723,8 @@ class CodeMateAgent:
         系统提示词包括：
         1. 基础提示词（SYSTEM_PROMPT）：定义 Agent 的角色
         2. 长期记忆（如果有）：用户偏好、项目上下文等
-        3. 工具列表：告诉 LLM 有哪些工具可用
+        3. 可用 Skills（索引层）：轻量提示
+        4. 工具列表：告诉 LLM 有哪些工具可用
 
         Returns:
             str: 完整的系统提示词
@@ -704,11 +737,96 @@ class CodeMateAgent:
             if memory.strip() and not memory.startswith("# 长期记忆\n\n暂无"):
                 prompt_parts.append(f"\n## 长期记忆\n{memory}")
 
+        # 添加可用 Skills（只是索引，很轻量）
+        skills_hint = self.skill_manager.get_system_prompt_addition()
+        if skills_hint:
+            prompt_parts.append(skills_hint)
+
         # 获取所有工具的描述信息
         tools_desc = self.tool_registry.get_tools_description()
         prompt_parts.append(f"\n## 可用工具\n{tools_desc}")
 
         return "\n".join(prompt_parts)
+
+    def _detect_skill_declaration(self, content: str) -> Optional[str]:
+        """
+        检测 LLM 响应中是否声明使用了 Skill
+        
+        格式: [使用 Skill: skill-name] 或 [Using Skill: skill-name]
+        
+        Args:
+            content: LLM 响应内容
+            
+        Returns:
+            skill 名称，或 None
+        """
+        import re
+        
+        # 匹配中英文声明格式
+        patterns = [
+            r'\[使用\s*Skill[:\s]*([a-zA-Z0-9_-]+)\]',
+            r'\[Using\s*Skill[:\s]*([a-zA-Z0-9_-]+)\]',
+            r'\[Skill[:\s]*([a-zA-Z0-9_-]+)\]',
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, content, re.IGNORECASE)
+            if match:
+                skill_name = match.group(1).strip()
+                if self.skill_manager.skill_exists(skill_name):
+                    return skill_name
+        
+        return None
+
+    def _handle_skill_command(self, query: str) -> Optional[str]:
+        """
+        处理 skill 命令
+        
+        Args:
+            query: 用户输入，以 / 开头
+            
+        Returns:
+            处理后的 query（注入了 skill prompt），或 None（不是 skill 命令）
+        """
+        # 解析命令: /skill-name args
+        parts = query[1:].split(maxsplit=1)
+        if not parts:
+            return None
+        
+        skill_name = parts[0]
+        arguments = parts[1] if len(parts) > 1 else ""
+        
+        # 检查是否是有效的 skill
+        if not self.skill_manager.skill_exists(skill_name):
+            return None  # 不是 skill 命令，继续正常处理
+        
+        # 加载完整 skill 内容
+        skill_prompt = self.skill_manager.prepare_execution(skill_name, arguments)
+        if not skill_prompt:
+            return None
+        
+        self.logger.info(f"执行 Skill: {skill_name}, 参数: {arguments}")
+        
+        # 记录 skill 执行事件
+        if self.trace_logger:
+            self.trace_logger.log_event(
+                TraceEventType.INFO,
+                {"event": "skill_execution", "skill": skill_name, "arguments": arguments},
+            )
+        
+        # 构造增强的 query：skill 指令 + 原始参数
+        enhanced_query = f"""执行 Skill: {skill_name}
+
+## Skill 指令
+
+{skill_prompt}
+
+## 目标
+
+{arguments if arguments else "按照上述步骤执行"}
+"""
+        
+        return enhanced_query
 
     def reset(self):
         """
@@ -724,9 +842,12 @@ class CodeMateAgent:
         self._last_reported_total_tokens = 0
         self._recent_tool_calls = []
         self._loop_count = 0  # 重置循环计数器
+        self._skill_injected = False  # 重置 skill 注入标记
         # 重置规划器
         if self.planner:
             self.planner.reset()
+        # 清理 skill 缓存
+        self.skill_manager.clear_cache()
 
     def get_stats(self) -> dict:
         """

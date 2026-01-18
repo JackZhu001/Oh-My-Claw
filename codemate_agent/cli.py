@@ -381,6 +381,17 @@ def handle_command(
     elif cmd == "/tools":
         tools = agent.tool_registry.list_tools()
         console.print(f"[cyan]可用工具 ({len(tools)}):[/cyan]\n" + "\n".join(f"  - {t}" for t in tools))
+    elif cmd == "/skills":
+        skills = agent.skill_manager.get_available_skills()
+        if skills:
+            console.print(f"[cyan]可用 Skills ({len(skills)}):[/cyan]")
+            for skill_name in skills:
+                desc = agent.skill_manager._index.get(skill_name, "")
+                console.print(f"  - [green]/{skill_name}[/green]: {desc}")
+            console.print("\n使用方法: /<skill-name> <参数>")
+        else:
+            console.print("[yellow]暂无可用 Skills[/yellow]")
+            console.print(f"Skills 目录: {agent.skill_manager.skills_dir}")
     elif cmd == "/sessions":
         _list_sessions(session_index)
     elif cmd == "/history" and args:
@@ -408,11 +419,16 @@ def print_help() -> None:
   [cyan]/reset[/cyan]      - 重置 Agent 状态
   [cyan]/stats[/cyan]      - 显示统计信息
   [cyan]/tools[/cyan]      - 列出可用工具
+  [cyan]/skills[/cyan]     - 列出可用 Skills
   [cyan]/sessions[/cyan]   - 列出历史会话
   [cyan]/history <id>[/cyan] - 加载指定会话
   [cyan]/memory[/cyan]     - 查看长期记忆
   [cyan]/save[/cyan]       - 保存当前会话
   [cyan]exit[/cyan]        - 退出程序
+
+Skills 使用:
+  - 输入 [green]/<skill-name> <参数>[/green] 执行 Skill
+  - 例如: [green]/code-review src/agent/[/green]
 
 使用技巧:
   - 可以问关于代码结构的问题
