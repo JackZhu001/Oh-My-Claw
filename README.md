@@ -155,7 +155,10 @@ python -m pytest -q
 本项目最初的 Agent 学习路径和实践方法，受到了其公开内容的直接帮助。
 同时也感谢我在实现过程中借鉴过的工程思路：**Koder** 与 **OpenCode**。
 
-@Datawhale @HelloAgents @Koder @OpenCode
+[@DatawhaleChina](https://github.com/datawhalechina) ·
+[@hello-agents](https://github.com/datawhalechina/hello-agents) ·
+[@feiskyer/koder](https://github.com/feiskyer/koder) ·
+[@anomalyco/opencode](https://github.com/anomalyco/opencode)
 
 ---
 
