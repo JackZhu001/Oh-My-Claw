@@ -29,6 +29,11 @@ from codemate_agent.ui import console, print_banner, print_help, ProgressDisplay
 from codemate_agent.commands import handle_command
 
 
+def _print_cli_error(prefix: str, detail: object) -> None:
+    """安全打印错误，避免 Rich 将错误文本中的方括号当作 markup 解析。"""
+    console.print(f"{prefix}: {detail}", style="red", markup=False)
+
+
 def run_interactive(config: Config) -> None:
     """运行交互模式"""
     print_banner()
@@ -125,7 +130,7 @@ def run_interactive(config: Config) -> None:
             progress_callback=progress_display.on_event,
         )
     except Exception as e:
-        console.print(f"[red]初始化失败: {e}[/red]")
+        _print_cli_error("初始化失败", e)
         console.print("\n[yellow]提示: 请确保已设置 API_KEY 环境变量或在 .env 文件中配置[/yellow]")
         sys.exit(1)
 
@@ -262,7 +267,8 @@ def run_interactive(config: Config) -> None:
                     trace_logger.finalize()
 
             except Exception as e:
-                console.print(f"[red]执行出错: {e}[/red]\n")
+                _print_cli_error("执行出错", e)
+                console.print("")
                 if trace_logger:
                     trace_logger.log_event(
                         TraceEventType.ERROR,
@@ -356,7 +362,7 @@ def run_single_prompt(prompt: str, config: Config) -> None:
             progress_callback=progress_display.on_event,
         )
     except Exception as e:
-        console.print(f"[red]初始化失败: {e}[/red]")
+        _print_cli_error("初始化失败", e)
         sys.exit(1)
 
     console.print(f"[cyan]问题:[/cyan] {prompt}\n")
@@ -384,7 +390,7 @@ def run_single_prompt(prompt: str, config: Config) -> None:
             metrics.save(config.metrics_dir)
 
     except Exception as e:
-        console.print(f"[red]执行出错: {e}[/red]")
+        _print_cli_error("执行出错", e)
         if trace_logger:
             trace_logger.log_event(
                 TraceEventType.ERROR,
@@ -445,7 +451,7 @@ def main() -> None:
     # 验证配置
     valid, error = config.validate()
     if not valid:
-        console.print(f"[red]配置错误: {error}[/red]")
+        _print_cli_error("配置错误", error)
         sys.exit(1)
 
     # 运行
