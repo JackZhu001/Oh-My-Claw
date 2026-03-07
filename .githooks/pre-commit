@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(git rev-parse --show-toplevel)"
+cd "$ROOT_DIR"
+
+python - <<'PY'
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+
+def run_git(*args: str) -> str:
+    return subprocess.check_output(["git", *args], text=True, errors="ignore")
+
+
+staged_files = [p for p in run_git("diff", "--cached", "--name-only", "--diff-filter=ACMR").splitlines() if p]
+if not staged_files:
+    sys.exit(0)
+
+blocked_logs = [p for p in staged_files if p.startswith("logs/sessions/") or p.startswith("logs/traces/")]
+if blocked_logs:
+    print("✗ Commit blocked: runtime log files should not be committed.")
+    for path in blocked_logs:
+        print(f"  - {path}")
+    sys.exit(1)
+
+max_bytes = 5 * 1024 * 1024
+large_files = []
+for rel in staged_files:
+    path = Path(rel)
+    if path.exists() and path.is_file():
+        size = path.stat().st_size
+        if size > max_bytes:
+            large_files.append((rel, size))
+
+if large_files:
+    print(f"✗ Commit blocked: file larger than {max_bytes} bytes detected.")
+    for rel, size in large_files:
+        print(f"  - {rel} ({size} bytes)")
+    sys.exit(1)
+
+added_lines = []
+for line in run_git("diff", "--cached", "-U0").splitlines():
+    if line.startswith("+++"):
+        continue
+    if line.startswith("+"):
+        added_lines.append(line[1:])
+
+secret_patterns = [
+    re.compile(r"(API_KEY|SECRET|PASSWORD|TOKEN)\s*=\s*['\"][^'\"]+['\"]"),
+    re.compile(r"BEGIN (RSA|OPENSSH|EC|DSA) PRIVATE KEY"),
+    re.compile(r"AKIA[0-9A-Z]{16}"),
+]
+
+for line in added_lines:
+    if any(p.search(line) for p in secret_patterns):
+        print("✗ Commit blocked: potential secret detected in staged changes.")
+        print("  Please remove secrets and use environment variables instead.")
+        sys.exit(1)
+
+sys.exit(0)
+PY

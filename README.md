@@ -211,6 +211,12 @@ python -m codemate_agent.cli
 python -m pytest -q
 ```
 
+建议启用仓库内置的提交前检查（大文件 / 日志 / 密钥拦截）：
+
+```bash
+git config core.hooksPath .githooks
+```
+
 ---
 
 ## 🙏 致谢

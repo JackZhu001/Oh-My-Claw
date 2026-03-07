@@ -518,6 +518,7 @@ class CodeMateAgent:
             # 步骤 3: 检查 LLM 是否请求调用工具
             if response.tool_calls:
                 self.logger.debug(f"LLM 请求调用 {len(response.tool_calls)} 个工具")
+                self._premature_finish_attempts = 0
 
                 # 检测循环：记录本次工具调用
                 for tool_call in response.tool_calls:
@@ -657,14 +658,14 @@ class CodeMateAgent:
                 
                 # 工具结果已添加，继续循环，让 LLM 处理工具结果
             else:
-                # 若存在未完成计划且回答为空/仅思考片段，强制继续执行，避免“提前结束”
+                # 若存在未完成计划且回答为空/阶段性口吻，强制继续执行，避免“提前结束”
                 if (
-                    self.planning_enabled
-                    and self.planner
-                    and self.planner.current_plan is not None
-                    and not self._todo_all_completed
-                    and not self._is_substantive_response(response.content or "")
-                    and self._premature_finish_attempts < 2
+                    self._has_unfinished_plan()
+                    and (
+                        not self._is_substantive_response(response.content or "")
+                        or self._is_non_final_progress_response(response.content or "")
+                    )
+                    and self._premature_finish_attempts < 3
                 ):
                     self._premature_finish_attempts += 1
                     self.logger.warning("检测到计划未完成且响应内容不足，注入继续执行提示")
@@ -726,6 +727,48 @@ class CodeMateAgent:
         import re
         text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE).strip()
         return bool(text)
+
+    def _is_non_final_progress_response(self, content: str) -> bool:
+        """判断是否是“还在进行中”的阶段性描述，防止未完成计划提前结束。"""
+        import re
+
+        text = (content or "").strip()
+        if not text:
+            return True
+        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE).strip()
+        if not text:
+            return True
+
+        final_markers = ("已完成", "完成如下", "最终结果", "文件清单", "已生成", "总结")
+        if any(marker in text for marker in final_markers):
+            return False
+
+        progress_markers = ("现在进行", "正在", "即将", "接下来", "稍后", "下一步", "将会", "我会")
+        return any(marker in text for marker in progress_markers)
+
+    def _has_unfinished_plan(self) -> bool:
+        """判断当前计划是否仍有未完成任务。"""
+        if not (self.planning_enabled and self.planner and self.planner.current_plan is not None):
+            return False
+
+        from codemate_agent.tools.todo.todo_write import TodoWriteTool
+
+        todo_state = TodoWriteTool.get_current_state()
+        if not todo_state:
+            return not self._todo_all_completed
+
+        stats = todo_state.get("stats", {})
+        pending = int(stats.get("pending", 0))
+        in_progress = int(stats.get("in_progress", 0))
+        if pending + in_progress > 0:
+            return True
+
+        total = int(stats.get("total", 0))
+        completed = int(stats.get("completed", 0))
+        cancelled = int(stats.get("cancelled", 0))
+        if total > 0 and completed + cancelled >= total:
+            return False
+        return not self._todo_all_completed
 
     def _execute_tool_call(self, tool_call: ToolCall) -> str:
         """

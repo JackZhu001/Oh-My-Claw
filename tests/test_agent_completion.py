@@ -1,5 +1,6 @@
 from codemate_agent.agent.agent import CodeMateAgent
 from codemate_agent.schema import LLMResponse, ToolCall, FunctionCall
+from codemate_agent.tools.todo.todo_write import TodoWriteTool
 
 
 class DummyLLM:
@@ -46,6 +47,29 @@ class NagTriggerLLM:
                 usage=None,
             )
         return LLMResponse(content="done", tool_calls=None, finish_reason="stop", usage=None)
+
+
+class PendingTodoLLM:
+    model = "dummy-model"
+
+    def __init__(self):
+        self.calls = 0
+
+    def complete(self, messages, tools=None):
+        self.calls += 1
+        if self.calls == 1:
+            return LLMResponse(
+                content="现在进行最终一致性检查",
+                tool_calls=None,
+                finish_reason="stop",
+                usage=None,
+            )
+        return LLMResponse(
+            content="已生成文件：docs/review.md",
+            tool_calls=None,
+            finish_reason="stop",
+            usage=None,
+        )
 
 
 def _has_todo_nag(messages) -> bool:
@@ -106,3 +130,26 @@ def test_todo_nag_can_be_disabled(monkeypatch, tmp_path):
     result = agent.run("run")
     assert result == "done"
     assert not _has_todo_nag(agent.messages)
+
+
+def test_prevent_finish_when_todo_still_pending(monkeypatch, tmp_path):
+    monkeypatch.setenv("HEARTBEAT_ENABLED", "false")
+    TodoWriteTool.clear()
+    TodoWriteTool._current_summary = "review"
+    TodoWriteTool._current_todos = [{"content": "完成审查", "status": "pending"}]
+
+    llm = PendingTodoLLM()
+    agent = CodeMateAgent(
+        llm_client=llm,
+        tools=[],
+        workspace_dir=str(tmp_path),
+        compression_enabled=False,
+        planning_enabled=True,
+    )
+    agent.planner.current_plan = object()
+    agent._todo_all_completed = False
+
+    result = agent.run("对项目做 code review")
+    assert "已生成文件" in result
+    assert llm.calls == 2
+    TodoWriteTool.clear()

@@ -62,3 +62,9 @@ venv.bak/
 *.db
 *.log
 codemate_sessions/
+
+# Runtime artifacts
+logs/sessions/*.json
+logs/sessions/*.jsonl
+logs/traces/*.jsonl
+logs/traces/*.md

@@ -34,6 +34,19 @@ def _print_cli_error(prefix: str, detail: object) -> None:
     console.print(f"{prefix}: {detail}", style="red", markup=False)
 
 
+def _classify_shell_risk(command: str) -> str:
+    """粗粒度 shell 风险分类，用于确认提示。"""
+    text = (command or "").lower()
+    high_risk_markers = (
+        " rm ", " rm-", " chmod ", " chown ", " dd ", " mkfs ", " sudo ", ">/", ">>",
+        " curl ", " wget ", "| sh", "| bash",
+    )
+    padded = f" {text} "
+    if any(marker in padded for marker in high_risk_markers):
+        return "high"
+    return "normal"
+
+
 def run_interactive(config: Config) -> None:
     """运行交互模式"""
     print_banner()
@@ -163,7 +176,7 @@ def run_interactive(config: Config) -> None:
             bool: 用户是否同意执行
         """
         # 检查批量确认状态
-        if batch_state["auto_confirm"]:
+        if batch_state["auto_confirm"] and tool_name != "run_shell":
             return True
         if batch_state["auto_cancel"]:
             return False
@@ -180,7 +193,9 @@ def run_interactive(config: Config) -> None:
         elif tool_name == "run_shell":
             cmd = arguments.get("command", "")
             cmd_preview = (cmd[:60] + "...") if len(cmd) > 60 else cmd
-            params_display = f"command={repr(cmd_preview)}"
+            risk_level = _classify_shell_risk(cmd)
+            risk_label = "高风险" if risk_level == "high" else "常规"
+            params_display = f"command={repr(cmd_preview)} (风险等级: {risk_label})"
         else:
             # 通用格式化，限制每个参数的显示长度
             params = []
@@ -204,6 +219,9 @@ def run_interactive(config: Config) -> None:
                     console.print("[green]✓[/green] 已同意执行\n")
                     return True
                 elif response in ['a', 'all']:
+                    if tool_name == "run_shell":
+                        console.print("[yellow]! run_shell 不支持自动确认，请逐条确认[/yellow]\n")
+                        continue
                     console.print("[green]✓[/green] 已同意执行（后续操作自动确认）\n")
                     batch_state["auto_confirm"] = True
                     return True

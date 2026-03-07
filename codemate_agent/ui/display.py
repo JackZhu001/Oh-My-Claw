@@ -108,19 +108,23 @@ def print_sessions(sessions: list) -> None:
 
 def print_error(message: str) -> None:
     """打印错误信息"""
-    console.print(f"[red]{message}[/red]\n")
+    console.print(message, style="red", markup=False)
+    console.print("")
 
 
 def print_warning(message: str) -> None:
     """打印警告信息"""
-    console.print(f"[yellow]{message}[/yellow]\n")
+    console.print(message, style="yellow", markup=False)
+    console.print("")
 
 
 def print_success(message: str) -> None:
     """打印成功信息"""
-    console.print(f"[green]{message}[/green]\n")
+    console.print(message, style="green", markup=False)
+    console.print("")
 
 
 def print_info(message: str) -> None:
     """打印信息"""
-    console.print(f"[cyan]{message}[/cyan]\n")
+    console.print(message, style="cyan", markup=False)
+    console.print("")
