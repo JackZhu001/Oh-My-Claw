@@ -6,6 +6,21 @@ description: |
   - "code review" / "代码审查" / "审查代码" / "review 一下"
   - "检查代码质量" / "代码有什么问题"
   - "安全审查" / "找漏洞"
+trigger_priority: 3
+trigger_min_hits: 1
+trigger_keywords:
+  - code review
+  - 代码审查
+  - 审查代码
+  - review代码
+  - 检查代码
+  - 代码质量
+  - 代码问题
+  - 安全审查
+  - 找漏洞
+  - 漏洞
+  - 安全检查
+  - review 一下
 ---
 
 # Code Review

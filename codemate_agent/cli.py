@@ -47,6 +47,24 @@ def _classify_shell_risk(command: str) -> str:
     return "normal"
 
 
+def _canonical_confirm_response(response: str) -> str:
+    """规范化确认输入，容忍重复按键（如 yyyyy）。"""
+    clean = (response or "").strip().lower()
+    aliases = {"yes": "y", "all": "a", "no": "n", "quit": "q"}
+    if clean in aliases:
+        return aliases[clean]
+    if clean in {"y", "a", "n", "q"}:
+        return clean
+    if clean and len(set(clean)) == 1 and clean[0] in {"y", "a", "n", "q"}:
+        return clean[0]
+    return clean
+
+
+def _should_auto_confirm(batch_state: dict, tool_name: str) -> bool:
+    _ = tool_name
+    return bool(batch_state.get("auto_confirm"))
+
+
 def run_interactive(config: Config) -> None:
     """运行交互模式"""
     print_banner()
@@ -176,7 +194,7 @@ def run_interactive(config: Config) -> None:
             bool: 用户是否同意执行
         """
         # 检查批量确认状态
-        if batch_state["auto_confirm"] and tool_name != "run_shell":
+        if _should_auto_confirm(batch_state, tool_name):
             return True
         if batch_state["auto_cancel"]:
             return False
@@ -190,7 +208,7 @@ def run_interactive(config: Config) -> None:
         elif tool_name == "delete_file":
             file_path = arguments.get("file_path", "未知文件")
             params_display = f"file_path={repr(file_path)}"
-        elif tool_name == "run_shell":
+        elif tool_name in {"run_shell", "background_run"}:
             cmd = arguments.get("command", "")
             cmd_preview = (cmd[:60] + "...") if len(cmd) > 60 else cmd
             risk_level = _classify_shell_risk(cmd)
@@ -214,21 +232,18 @@ def run_interactive(config: Config) -> None:
         # 获取用户输入
         while True:
             try:
-                response = session.prompt("  确认执行吗？(y/a/n/q): ").strip().lower()
-                if response in ['y', 'yes']:
+                response = _canonical_confirm_response(session.prompt("  确认执行吗？(y/a/n/q): "))
+                if response == "y":
                     console.print("[green]✓[/green] 已同意执行\n")
                     return True
-                elif response in ['a', 'all']:
-                    if tool_name == "run_shell":
-                        console.print("[yellow]! run_shell 不支持自动确认，请逐条确认[/yellow]\n")
-                        continue
+                elif response == "a":
                     console.print("[green]✓[/green] 已同意执行（后续操作自动确认）\n")
                     batch_state["auto_confirm"] = True
                     return True
-                elif response in ['n', 'no', '']:
+                elif response in {"n", ""}:
                     console.print("[red]✗[/red] 已取消操作\n")
                     return False
-                elif response in ['q', 'quit']:
+                elif response == "q":
                     console.print("[red]✗[/red] 已取消操作（后续操作自动取消）\n")
                     batch_state["auto_cancel"] = True
                     return False

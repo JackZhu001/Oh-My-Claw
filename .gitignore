@@ -68,3 +68,14 @@ logs/sessions/*.json
 logs/sessions/*.jsonl
 logs/traces/*.jsonl
 logs/traces/*.md
+
+# Team runtime artifacts
+.team/
+.tasks/
+
+# Local transcripts / reports
+.transcripts/
+codereview 3/
+
+# Demo outputs
+/demo/

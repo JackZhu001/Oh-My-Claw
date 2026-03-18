@@ -4,10 +4,13 @@
 管理用户偏好、项目上下文等长期信息。
 """
 
-from pathlib import Path
-from typing import Optional
+import logging
 import math
 import re
+from pathlib import Path
+from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 
 class MemoryManager:
@@ -118,15 +121,21 @@ src/
         """加载用户偏好"""
         path = self.memory_dir / self.USER_PREFERENCES
         if path.exists():
-            with open(path, "r", encoding="utf-8") as f:
-                return f.read()
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    return f.read()
+            except OSError as e:
+                logger.warning(f"读取用户偏好文件失败，返回默认值: {e}")
         return self._default_user_preferences()
 
     def save_user_preferences(self, content: str) -> None:
         """保存用户偏好"""
         path = self.memory_dir / self.USER_PREFERENCES
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(content)
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content)
+        except OSError as e:
+            logger.error(f"保存用户偏好失败: {e}")
 
     def update_user_preference(self, key: str, value: str) -> None:
         """
@@ -160,15 +169,21 @@ src/
         """加载项目上下文"""
         path = self.memory_dir / self.PROJECT_CONTEXT
         if path.exists():
-            with open(path, "r", encoding="utf-8") as f:
-                return f.read()
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    return f.read()
+            except OSError as e:
+                logger.warning(f"读取项目上下文失败，返回默认值: {e}")
         return self._default_project_context()
 
     def save_project_context(self, content: str) -> None:
         """保存项目上下文"""
         path = self.memory_dir / self.PROJECT_CONTEXT
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(content)
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content)
+        except OSError as e:
+            logger.error(f"保存项目上下文失败: {e}")
 
     # ==================== 代码片段 ====================
 
@@ -176,15 +191,21 @@ src/
         """加载代码片段"""
         path = self.memory_dir / self.CODE_SNIPPETS
         if path.exists():
-            with open(path, "r", encoding="utf-8") as f:
-                return f.read()
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    return f.read()
+            except OSError as e:
+                logger.warning(f"读取代码片段失败，返回默认值: {e}")
         return self._default_code_snippets()
 
     def save_code_snippets(self, content: str) -> None:
         """保存代码片段"""
         path = self.memory_dir / self.CODE_SNIPPETS
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(content)
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content)
+        except OSError as e:
+            logger.error(f"保存代码片段失败: {e}")
 
     # ==================== 自定义记忆 ====================
 
@@ -192,15 +213,21 @@ src/
         """加载自定义记忆"""
         path = self.memory_dir / self.CUSTOM_MEMORY
         if path.exists():
-            with open(path, "r", encoding="utf-8") as f:
-                return f.read()
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    return f.read()
+            except OSError as e:
+                logger.warning(f"读取自定义记忆失败，返回默认值: {e}")
         return "# 自定义记忆\n\n> 在此添加任何您希望 Agent 记住的信息。\n"
 
     def save_custom_memory(self, content: str) -> None:
         """保存自定义记忆"""
         path = self.memory_dir / self.CUSTOM_MEMORY
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(content)
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content)
+        except OSError as e:
+            logger.error(f"保存自定义记忆失败: {e}")
 
     # ==================== 组合加载 ====================
 
@@ -269,9 +296,21 @@ src/
         """加载项目 codemate.md（若存在）"""
         path = Path(workspace_dir) / self.CODEMATE_FILE
         if path.exists():
-            with open(path, "r", encoding="utf-8") as f:
-                return f.read()
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    return f.read()
+            except OSError as e:
+                logger.warning(f"读取 codemate.md 失败: {e}")
         return ""
+
+    def save_codemate_file(self, workspace_dir: Path, content: str) -> None:
+        """保存项目 codemate.md"""
+        path = Path(workspace_dir) / self.CODEMATE_FILE
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content)
+        except OSError as e:
+            logger.error(f"保存 codemate.md 失败: {e}")
 
     def init_codemate_file(self, workspace_dir: Path, tools: Optional[list[str]] = None) -> Path:
         """初始化 codemate.md（若不存在）"""

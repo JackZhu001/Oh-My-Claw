@@ -5,6 +5,7 @@
 """
 
 import logging
+import re
 from typing import Optional, Dict, Any, Tuple
 
 logger = logging.getLogger(__name__)
@@ -86,6 +87,30 @@ class ArgumentValidator:
             "required": ["description", "prompt"],
             "min_length": {"description": 3, "prompt": 5},
         },
+        "task_create": {
+            "required": ["subject"],
+            "min_length": {"subject": 1},
+        },
+        "task_get": {
+            "required": ["task_id"],
+        },
+        "task_update": {
+            "required": ["task_id"],
+        },
+        "task_cleanup": {},
+        "team_status": {},
+        "background_run": {
+            "required": ["command"],
+            "min_length": {"command": 1},
+        },
+        "memory_write": {
+            "required": ["content", "category"],
+            "min_length": {"content": 1},
+        },
+        "memory_read": {
+            "required": ["query"],
+            "min_length": {"query": 1},
+        },
     }
     
     @classmethod
@@ -105,7 +130,7 @@ class ArgumentValidator:
             rules = cls.TOOL_PARAM_RULES.get(tool_name, {})
             if rules.get("required"):
                 # 🆕 检测是否是写文件类工具，给出更有用的建议
-                if tool_name in ("write_file", "append_file", "edit_file"):
+                if tool_name in ("write_file", "append_file", "edit_file", "write_file_chunks", "append_file_chunks"):
                     return (
                         f"工具 '{tool_name}' 参数为空（可能是输出被截断）。\n"
                         f"建议：如果要写入大量代码，请分多次写入：\n"
@@ -171,8 +196,39 @@ class ArgumentValidator:
                         f"参数 '{param}' 过长（{len(value)} 字符，最大 {max_len}）。"
                         f"请改用 write_file_chunks/append_file_chunks 分块写入。"
                     )
-        
+
+        # 针对 run_shell / background_run 的内容体检，避免把表格或说明文本当命令执行
+        if tool_name in ("run_shell", "background_run"):
+            command = arguments.get("command")
+            if isinstance(command, str) and cls._looks_like_table(command):
+                return (
+                    "参数 'command' 看起来不是命令（疑似表格/说明文本）。"
+                    "请只传入可直接执行的 shell 命令。"
+                )
+
         return None
+
+    @classmethod
+    def _looks_like_table(cls, text: str) -> bool:
+        """检测 Markdown/ASCII 表格样式，避免误当成命令。"""
+        sample = text.strip()
+        if not sample:
+            return False
+        # 多行表格特征
+        if "\n" in sample:
+            lines = [ln.strip() for ln in sample.splitlines() if ln.strip()]
+            if not lines:
+                return False
+            border_like = sum(1 for ln in lines if ln.startswith("+") and ln.endswith("+"))
+            pipe_like = sum(1 for ln in lines if ln.startswith("|") and ln.endswith("|"))
+            if border_like + pipe_like >= 2:
+                return True
+        # 单行表格特征
+        if re.search(r"^\+[-+]+\+$", sample):
+            return True
+        if sample.startswith("|") and sample.endswith("|") and sample.count("|") >= 3:
+            return True
+        return False
     
     @classmethod
     def _check_suspicious_value(cls, key: str, value: Any) -> Optional[str]:
@@ -262,6 +318,14 @@ class ArgumentValidator:
             "search_code": "search_code(pattern='def function_name')",
             "search_files": "search_files(pattern='*.py')",
             "task": "task(description='任务描述', prompt='详细指令', subagent_type='explore')",
+            "task_create": "task_create(subject='实现登录', description='补充登录流程')",
+            "task_get": "task_get(task_id=1)",
+            "task_update": "task_update(task_id=1, status='in_progress', add_blocks=[2])",
+            "task_list": "task_list()",
+            "task_cleanup": "task_cleanup(namespace='ITEST') 或 task_cleanup(all_tasks=true)",
+            "team_status": "team_status(event_limit=20)",
+            "background_run": "background_run(command='pytest -q', timeout=180, allow_parallel=false)",
+            "check_background": "check_background(task_id='abcd1234') 或 check_background()",
         }
         
         return hints.get(tool_name, f"{tool_name}(参数=实际值)")

@@ -78,8 +78,8 @@ def test_heartbeat_pending_todo_check(monkeypatch, tmp_path):
         planning_enabled=False,
     )
     # 人工模拟长时间空闲
-    agent._last_activity_ts = time.time() - 2
-    agent._heartbeat_pending_check_once()
+    agent.heartbeat._last_activity_ts = time.time() - 2
+    agent.heartbeat._pending_check_once()
     status = agent.get_heartbeat_status()
     assert status["pending_todos"] >= 1
     TodoWriteTool.clear()

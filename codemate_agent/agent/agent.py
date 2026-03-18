@@ -19,15 +19,14 @@ import json
 import os
 import uuid
 import time
-import threading
-from typing import List, Optional, Callable
+from typing import Any, List, Optional, Callable
 from pathlib import Path
 
 from codemate_agent.llm.client import LLMClient as GLMClient
-from codemate_agent.schema import Message, LLMResponse, ToolCall
+from codemate_agent.schema import Message, LLMResponse, ToolCall, FunctionCall
 from codemate_agent.tools.base import Tool
 from codemate_agent.tools.registry import ToolRegistry
-from codemate_agent.logging import setup_logger, TraceLogger, SessionMetrics, generate_session_id, TraceEventType
+from codemate_agent.logging import setup_logger, TraceLogger, SessionMetrics, TraceEventType
 from codemate_agent.persistence import SessionStorage, MemoryManager
 from codemate_agent.context import ContextCompressor, CompressionConfig, ObservationTruncator
 from codemate_agent.planner import TaskPlanner
@@ -36,6 +35,9 @@ from codemate_agent.validation import ArgumentValidator
 from codemate_agent.skill import SkillManager
 from codemate_agent.prompts import SYSTEM_PROMPT
 from codemate_agent.agent.loop_detector import LoopDetector
+from codemate_agent.agent.heartbeat import HeartbeatMonitor
+from codemate_agent.agent.loop_guard import LoopGuard
+from codemate_agent.agent.team_runtime import TeamRuntime
 
 
 # 需要用户确认的危险工具
@@ -43,6 +45,8 @@ DANGEROUS_TOOLS = {
     "delete_file",
     "write_file",
     "run_shell",
+    "background_run",
+    "task_cleanup",
 }
 
 
@@ -134,11 +138,8 @@ class CodeMateAgent:
         
         # 循环检测器
         self.loop_detector = LoopDetector(window_size=10)
-        self._loop_count = 0  # 循环检测计数器
-        
-        # 连续失败跟踪（现在由 ToolExecutor 管理，这里只保留引用）
-        self._consecutive_failures = 0
-        self._max_consecutive_failures = 3
+        # LoopGuard：集中处理连续失败与提前结束防护
+        self.loop_guard = LoopGuard(max_consecutive_failures=3)
 
         # todo 进度跟踪 + nag reminder
         self._todo_all_completed = False  # 所有 todo 是否完成
@@ -154,7 +155,7 @@ class CodeMateAgent:
             self._max_rounds_without_todo = 6
         nag_env_enabled = os.getenv("TODO_NAG_ENABLED", "true").lower() == "true"
         self._todo_nag_enabled = nag_env_enabled and self._max_rounds_without_todo > 0
-        self._premature_finish_attempts = 0
+        # 由 LoopGuard 管理 premature finish
 
         # 工具注册：将所有工具注册到注册器中
         # 这样可以通过工具名称快速查找和执行工具
@@ -175,6 +176,7 @@ class CodeMateAgent:
 
         # Skill 管理器（渐进式加载）
         self.skill_manager = SkillManager()
+        self.skill_auto_trigger_enabled = os.getenv("SKILL_AUTO_TRIGGER_ENABLED", "true").lower() == "true"
 
         # Task 工具：用于委托子代理
         # 需要注入依赖（llm_client, tool_registry, 以及可选的 light_llm_client）
@@ -204,36 +206,99 @@ class CodeMateAgent:
         # 注册 Compact 工具
         self.tool_registry.register(self.compact_tool)
 
+        # MemoryWrite / MemoryRead 工具：主动读写长期记忆
+        if self.memory_manager is not None:
+            from codemate_agent.tools.memory.memory_write import MemoryWriteTool
+            MemoryWriteTool.set_dependencies(
+                memory_manager=self.memory_manager,
+                workspace_dir=self.workspace_dir,
+            )
+            self.tool_registry.register(MemoryWriteTool())
+
+            from codemate_agent.tools.memory.memory_read import MemoryReadTool
+            MemoryReadTool.set_dependencies(memory_manager=self.memory_manager)
+            self.tool_registry.register(MemoryReadTool())
+
         # 统计信息
         self.round_count = 0      # 当前对话轮数
         self.total_tokens = 0     # 累计消耗的 token 数
 
+        # 会话标识
+        self.session_id = getattr(self.trace_logger, "session_id", f"local-{uuid.uuid4().hex[:8]}")
+
         # 心跳监控
-        self.heartbeat_enabled = os.getenv("HEARTBEAT_ENABLED", "true").lower() == "true"
-        self.heartbeat_timeout_seconds = int(os.getenv("HEARTBEAT_TIMEOUT_SECONDS", "45"))
-        self.heartbeat_mode = os.getenv("HEARTBEAT_MODE", "task_polling")  # task_polling | verbose
-        self.heartbeat_verbose = self.heartbeat_mode == "verbose"
-        session_id = getattr(self.trace_logger, "session_id", f"local-{uuid.uuid4().hex[:8]}")
+        heartbeat_enabled = os.getenv("HEARTBEAT_ENABLED", "true").lower() == "true"
+        heartbeat_timeout_seconds = int(os.getenv("HEARTBEAT_TIMEOUT_SECONDS", "45"))
+        heartbeat_mode = os.getenv("HEARTBEAT_MODE", "task_polling")  # task_polling | verbose
+        heartbeat_poll_seconds = int(os.getenv("HEARTBEAT_POLL_SECONDS", "15"))
         heartbeat_dir = Path(os.getenv("HEARTBEAT_DIR", "logs/sessions"))
-        heartbeat_dir.mkdir(parents=True, exist_ok=True)
-        self._heartbeat_file = heartbeat_dir / f"heartbeat-{session_id}.jsonl"
-        self._heartbeat_state = {
-            "session_id": session_id,
-            "phase": "idle",
-            "last_beat_ts": time.time(),
-            "last_tool": "",
-            "beats": 0,
-            "stalled": False,
-            "last_alert": "",
-            "last_todo_check_ts": 0.0,
-            "pending_todos": 0,
-        }
-        self._last_activity_ts = time.time()
-        self.heartbeat_poll_seconds = int(os.getenv("HEARTBEAT_POLL_SECONDS", "15"))
-        self._heartbeat_stop_event = threading.Event()
-        self._heartbeat_thread: Optional[threading.Thread] = None
-        self._emit_heartbeat("idle", source="init")
-        self._start_heartbeat_worker()
+
+        def _todo_stats() -> tuple[int, int]:
+            from codemate_agent.tools.todo.todo_write import TodoWriteTool
+            todo_state = TodoWriteTool.get_current_state()
+            pending = 0
+            in_progress = 0
+            if todo_state:
+                stats = todo_state.get("stats", {})
+                pending = int(stats.get("pending", 0))
+                in_progress = int(stats.get("in_progress", 0))
+            return pending, in_progress
+
+        self.heartbeat = HeartbeatMonitor(
+            session_id=self.session_id,
+            heartbeat_dir=heartbeat_dir,
+            enabled=heartbeat_enabled,
+            timeout_seconds=heartbeat_timeout_seconds,
+            mode=heartbeat_mode,
+            poll_seconds=heartbeat_poll_seconds,
+            progress_callback=self.progress_callback,
+            logger=self.logger,
+            state_provider=lambda: {
+                "round": self.round_count,
+                "message_count": len(self.messages),
+                "total_tokens": self.total_tokens,
+            },
+            todo_stats_provider=_todo_stats,
+            todo_nag_enabled=self._todo_nag_enabled,
+        )
+        self.heartbeat.emit("idle", source="init")
+        self.heartbeat.start_worker()
+
+        # 团队协作运行时（可选）
+        self.team_enabled = os.getenv("TEAM_AGENT_ENABLED", "false").lower() == "true"
+        self.background_tasks_enabled = os.getenv("BACKGROUND_TASKS_ENABLED", "true").lower() == "true"
+        self.team_name = os.getenv("TEAM_NAME", "default")
+        self.team_agent_name = os.getenv("TEAM_AGENT_NAME", "lead")
+        self.team_agent_role = os.getenv("TEAM_AGENT_ROLE", "lead")
+        self.task_auto_claim_enabled = os.getenv("TASK_AUTO_CLAIM_ENABLED", "false").lower() == "true"
+        self._identity_reinject_threshold = int(os.getenv("TEAM_IDENTITY_REINJECT_THRESHOLD", "6"))
+        self.team = TeamRuntime(
+            enabled=self.team_enabled,
+            workspace_dir=self.workspace_dir,
+            team_name=self.team_name,
+            agent_name=self.team_agent_name,
+            agent_role=self.team_agent_role,
+            tool_registry=self.tool_registry,
+            messages=self.messages,
+            session_id_provider=lambda: self.session_id,
+            round_provider=lambda: self.round_count,
+            progress_callback=self.progress_callback,
+            logger=self.logger,
+            task_auto_claim_enabled=self.task_auto_claim_enabled,
+            background_tasks_enabled=self.background_tasks_enabled,
+            identity_reinject_threshold=self._identity_reinject_threshold,
+        ) if self.team_enabled else None
+        if self.team:
+            self.team.ensure_identity_block(force=True)
+            self.team.sync_shell_context()
+            self.team.emit_event(
+                "team_runtime_ready",
+                {
+                    "team": self.team_name,
+                    "agent_name": self.team_agent_name,
+                    "agent_role": self.team_agent_role,
+                },
+            )
 
     def run(self, query: str) -> str:
         """
@@ -263,10 +328,26 @@ class CodeMateAgent:
             if skill_result is not None:
                 # skill 命令已处理，将 skill prompt 注入后继续执行
                 query = skill_result
+        else:
+            auto_skill = self._try_auto_trigger_skill(query)
+            if auto_skill is not None:
+                skill_name, enhanced_query = auto_skill
+                query = enhanced_query
+                self._emit_progress(
+                    "skill_auto_selected",
+                    {
+                        "skill": skill_name,
+                        "hint": "本次由意图自动触发；可在下次输入前加 [no-skill] 关闭自动触发。",
+                    },
+                )
+                self._emit_team_event("skill_auto_selected", {"skill": skill_name})
 
         # 每轮根据当前 query 刷新 system prompt（包含关键词召回记忆 + codemate.md）
         if self.messages and self.messages[0].role == "system":
             self.messages[0] = Message(role="system", content=self._get_system_prompt(query))
+        if self.team:
+            self.team.ensure_identity_block()
+        self._inject_runtime_warnings(query)
 
         # 注意: 渐进式 Skill 加载
         # 不再自动注入完整 Skill 内容，而是让 LLM 通过 skill 工具按需加载
@@ -274,7 +355,8 @@ class CodeMateAgent:
 
         # 记录用户输入
         self.logger.info(f"用户输入: {query[:100]}...")
-        self._emit_heartbeat("run_started", source="run", query_len=len(query))
+        self.heartbeat.emit("run_started", source="run", query_len=len(query))
+        self._emit_team_event("run_started", {"query_len": len(query)})
         if self.trace_logger:
             self.trace_logger.log_event(
                 TraceEventType.USER_INPUT,
@@ -371,6 +453,7 @@ class CodeMateAgent:
         # 步骤 1: 将用户输入添加到消息历史
         self.messages.append(Message(role="user", content=query))
         self.round_count = 0
+        self._high_context_warned = False  # 每次 run 只注入一次高 context 警告
 
         # 获取所有工具的 OpenAI Schema 格式
         # LLM 需要知道有哪些工具可用，以及每个工具的参数格式
@@ -382,19 +465,45 @@ class CodeMateAgent:
             if self.metrics:
                 self.metrics.record_round()
 
+            if self.team:
+                self.team.ingest_inbox()
+                self.team.auto_claim_task()
+                self.team.ingest_background_notifications()
+                self.team.ensure_identity_block()
+            elif self.background_tasks_enabled:
+                self._ingest_background_notifications()
+
             # ========== Layer 1: Micro Compact (每轮执行) ==========
             if self.compression_enabled and self.compressor:
                 self.messages = self.compressor.micro_compact(self.messages)
                 # 更新 CompactTool 的 messages 引用
                 from codemate_agent.tools.compact import CompactTool
                 CompactTool._messages_ref = self.messages
+                if self.team:
+                    self.team.ensure_identity_block()
 
             # 触发轮次开始事件
             self._emit_progress("round_start", {
                 "round": self.round_count,
                 "max_rounds": self.max_rounds,
             })
-            self._emit_heartbeat("round_start", source="loop", round=self.round_count)
+            self.heartbeat.emit("round_start", source="loop", round=self.round_count)
+            self._emit_team_event("round_start", {"round": self.round_count})
+
+            # ========== 高 Context 警告（每次 run 只注入一次）==========
+            if not self._high_context_warned and self.compression_enabled and self.compressor:
+                estimated = self.compressor.estimate_tokens(self.messages)
+                if estimated > 50000:
+                    self._high_context_warned = True
+                    self.messages.append(Message(
+                        role="system",
+                        content=(
+                            "<warning>当前上下文较大（约 {est}k tokens）。"
+                            "调用写文件工具时参数必须完整，切勿省略 file_path / chunks / content。"
+                            "若因输出截断导致参数为空，请缩短单次输出后重试。</warning>"
+                        ).format(est=round(estimated / 1000)),
+                    ))
+                    self.logger.info(f"[high_context] 已注入警告 (estimated={estimated})")
 
             # ========== Todo Nag Reminder ==========
             # 如果多轮未更新 todo，注入提醒
@@ -423,7 +532,8 @@ class CodeMateAgent:
             # - messages: 完整的对话历史
             # - tools: 可用工具列表（OpenAI Function Calling 格式）
             start_time = time.time()
-            self._emit_heartbeat("llm_request", source="llm", round=self.round_count)
+            self.heartbeat.emit("llm_request", source="llm", round=self.round_count)
+            self._emit_team_event("llm_request", {"round": self.round_count, "messages": len(self.messages)})
 
             # 记录 LLM 请求
             if self.trace_logger:
@@ -443,8 +553,16 @@ class CodeMateAgent:
             )
 
             duration_ms = (time.time() - start_time) * 1000
-            self._emit_heartbeat("llm_response", source="llm", duration_ms=round(duration_ms, 2))
-            self._check_heartbeat_timeout("llm", duration_ms)
+            self.heartbeat.emit("llm_response", source="llm", duration_ms=round(duration_ms, 2))
+            self.heartbeat.check_timeout("llm", duration_ms)
+            self._emit_team_event(
+                "llm_response",
+                {
+                    "round": self.round_count,
+                    "duration_ms": round(duration_ms, 2),
+                    "tool_calls": len(response.tool_calls) if response.tool_calls else 0,
+                },
+            )
 
             # 更新 token 统计（用于成本控制）
             if response.usage:
@@ -453,15 +571,27 @@ class CodeMateAgent:
                 # 检查 token 数是否合理（单次请求通常不应超过 15000）
                 # GLM API 有时返回累计值而非单次值
                 SINGLE_REQUEST_TOKEN_LIMIT = 15000
+                # delta 合法性上限：单次对话不可能超过 100k token
+                DELTA_MAX = 100_000
                 if reported_total > SINGLE_REQUEST_TOKEN_LIMIT:
                     # 检测到累计值，计算差值
                     if self._last_reported_total_tokens > 0:
                         actual_tokens = reported_total - self._last_reported_total_tokens
-                        self._last_usage_tokens = actual_tokens
-                        self.total_tokens += actual_tokens
-                        self.logger.debug(
-                            f"检测到累计 token，计算差值: {reported_total} - {self._last_reported_total_tokens} = {actual_tokens}"
-                        )
+                        # 校验 delta 合法性：必须为正且不超过上限
+                        if 0 < actual_tokens < DELTA_MAX:
+                            self._last_usage_tokens = actual_tokens
+                            self.total_tokens += actual_tokens
+                            self.logger.debug(
+                                f"检测到累计 token，计算差值: {reported_total} - {self._last_reported_total_tokens} = {actual_tokens}"
+                            )
+                        else:
+                            # delta 异常（负数或超大），回退到估算
+                            estimated_tokens = len(str(response.content)) // 3 + 500
+                            self._last_usage_tokens = estimated_tokens
+                            self.total_tokens += estimated_tokens
+                            self.logger.warning(
+                                f"token delta 异常 ({actual_tokens})，使用估算值: {estimated_tokens}"
+                            )
                     else:
                         # 第一次调用，使用估算值
                         estimated_tokens = len(str(response.content)) // 3 + 1000
@@ -511,6 +641,18 @@ class CodeMateAgent:
                 tool_calls=response.tool_calls
             )
             self.messages.append(assistant_msg)
+            decision_summary = self._build_decision_summary(
+                response.content or "",
+                has_tool_calls=bool(response.tool_calls),
+            )
+            if decision_summary:
+                self._emit_progress(
+                    "assistant_decision",
+                    {
+                        "summary": decision_summary,
+                        "tool_calls": len(response.tool_calls) if response.tool_calls else 0,
+                    },
+                )
 
             # 注意: 渐进式 Skill 加载
             # 不再检测 LLM 声明，而是让 LLM 主动调用 skill 工具加载内容
@@ -518,7 +660,7 @@ class CodeMateAgent:
             # 步骤 3: 检查 LLM 是否请求调用工具
             if response.tool_calls:
                 self.logger.debug(f"LLM 请求调用 {len(response.tool_calls)} 个工具")
-                self._premature_finish_attempts = 0
+                self.loop_guard.reset_premature()
 
                 # 检测循环：记录本次工具调用
                 for tool_call in response.tool_calls:
@@ -530,23 +672,16 @@ class CodeMateAgent:
                 # 检测是否陷入循环
                 try:
                     if self._is_stuck_in_loop():
-                        loop_count = getattr(self, '_loop_count', 0) + 1
-                        self._loop_count = loop_count
+                        loop_info = self.loop_guard.on_loop_detected()
+                        loop_count = loop_info.get("count", 1)
+                        forced = loop_info.get("forced", False)
 
-                        loop_warning = (
-                            f"检测到 Agent 陷入循环（第 {loop_count} 次）。"
-                        )
-
-                        if loop_count >= 3:
-                            # 强制打破循环
+                        loop_warning = f"检测到 Agent 陷入循环（第 {loop_count} 次）。"
+                        if forced:
                             loop_warning += " 采取强制措施打破循环。"
                             self.logger.warning(loop_warning)
-
-                            # 清空循环检测器
                             self.loop_detector.reset()
-                            self._loop_count = 0
 
-                            # 添加强制干预消息
                             self.messages.append(Message(
                                 role="system",
                                 content="""严重警告：已连续 3 次检测到工具调用循环。请立即停止当前尝试的方法。
@@ -573,7 +708,6 @@ class CodeMateAgent:
                                     {"message": loop_warning, "recent_calls": self.loop_detector.recent_calls},
                                     step=self.round_count,
                                 )
-                            # 添加警告消息
                             self.messages.append(Message(
                                 role="system",
                                 content=f"警告：检测到重复的工具调用模式（第 {loop_count} 次）。请重新评估当前状态，尝试不同的方法。"
@@ -593,19 +727,32 @@ class CodeMateAgent:
                     self._emit_progress("tool_call_start", {
                         "tool": tool_name,
                         "args": self._format_args_for_display(arguments),
+                        "arguments": arguments,
                     })
-                    self._emit_heartbeat("tool_call_start", source="tool", tool=tool_name)
+                    self.heartbeat.emit("tool_call_start", source="tool", tool=tool_name)
+                    self._emit_team_event(
+                        "tool_call_start",
+                        {"tool": tool_name, "round": self.round_count},
+                    )
 
                     tool_start = time.time()
                     result = self._execute_tool_call(tool_call)
                     tool_duration_ms = (time.time() - tool_start) * 1000
-                    self._emit_heartbeat(
+                    self.heartbeat.emit(
                         "tool_call_end",
                         source="tool",
                         tool=tool_name,
                         duration_ms=round(tool_duration_ms, 2),
                     )
-                    self._check_heartbeat_timeout(f"tool:{tool_name}", tool_duration_ms)
+                    self.heartbeat.check_timeout(f"tool:{tool_name}", tool_duration_ms)
+                    self._emit_team_event(
+                        "tool_call_end",
+                        {
+                            "tool": tool_name,
+                            "round": self.round_count,
+                            "duration_ms": round(tool_duration_ms, 2),
+                        },
+                    )
 
                     # ========== 更新 todo 进度跟踪 ==========
                     if tool_name == "todo_write":
@@ -621,7 +768,9 @@ class CodeMateAgent:
                     # 触发工具调用完成事件
                     self._emit_progress("tool_call_end", {
                         "tool": tool_name,
-                        "success": not ("失败" in result or "错误" in result)
+                        "success": not self.loop_guard.is_error_result(result),
+                        "result_preview": self._summarize_tool_result(tool_name, result),
+                        "duration_ms": round(tool_duration_ms, 2),
                     })
 
                     # 将工具执行结果添加到消息历史
@@ -634,53 +783,41 @@ class CodeMateAgent:
                         name=tool_call.function.name
                     ))
 
+                    intervention = self.loop_guard.on_tool_result(tool_name, result)
+                    if intervention:
+                        self.logger.warning(f"工具 '{tool_name}' 连续失败，注入干预消息")
+                        self.messages.append(Message(
+                            role="system",
+                            content=intervention
+                        ))
+
                 # 每轮最多增加 1 次 nag 计数，避免单轮多工具导致计数暴涨
                 if not used_todo_this_round:
                     self._rounds_since_todo += 1
                 
-                # 🆕 检测连续失败次数，超过阈值时强制停止并报告
-                if self._consecutive_failures >= self._max_consecutive_failures:
-                    failure_msg = (
-                        f"⚠️ 检测到连续 {self._consecutive_failures} 次工具调用失败。\n\n"
-                        "这通常意味着当前方法不可行。可能的原因：\n"
-                        "1. 内容过长，超过单次输出限制\n"
-                        "2. 参数格式不正确\n"
-                        "3. 目标文件/路径不存在\n\n"
-                        "建议：请尝试将任务分解为更小的步骤，或使用不同的方法。"
-                    )
-                    self.logger.warning(f"连续失败 {self._consecutive_failures} 次，注入干预消息")
-                    self.messages.append(Message(
-                        role="system",
-                        content=failure_msg
-                    ))
-                    # 重置计数器，给 LLM 一次机会改变策略
-                    self._consecutive_failures = 0
-                
                 # 工具结果已添加，继续循环，让 LLM 处理工具结果
             else:
                 # 若存在未完成计划且回答为空/阶段性口吻，强制继续执行，避免“提前结束”
-                if (
-                    self._has_unfinished_plan()
-                    and (
-                        not self._is_substantive_response(response.content or "")
-                        or self._is_non_final_progress_response(response.content or "")
-                    )
-                    and self._premature_finish_attempts < 3
-                ):
-                    self._premature_finish_attempts += 1
+                intervention = self.loop_guard.on_llm_response(
+                    response.content or "",
+                    has_unfinished_plan=self._has_unfinished_plan(),
+                    is_substantive=self._is_substantive_response(response.content or ""),
+                    is_non_final_progress=self._is_non_final_progress_response(response.content or ""),
+                )
+                if intervention:
                     self.logger.warning("检测到计划未完成且响应内容不足，注入继续执行提示")
                     self.messages.append(Message(
                         role="system",
-                        content=(
-                            "当前计划尚未完成，请继续执行并产出实际结果。"
-                            "不要只输出思考过程；请调用合适工具完成文件写入或明确给出可交付产物。"
-                        ),
+                        content=intervention,
                     ))
                     continue
 
                 # 没有工具调用，说明 LLM 已经给出最终答案
                 self.logger.info(f"任务完成，共 {self.round_count} 轮")
-                self._emit_heartbeat("completed", source="run", total_rounds=self.round_count)
+                self.heartbeat.emit("completed", source="run", total_rounds=self.round_count)
+                self._emit_team_event("run_completed", {"total_rounds": self.round_count})
+                if self.team:
+                    self.team.complete_active_task()
 
                 # 保存助手回答到持久化存储
                 if self.session_storage:
@@ -715,7 +852,8 @@ class CodeMateAgent:
                 {"message": f"达到最大轮数 ({self.max_rounds})，任务未完成"},
                 step=self.round_count,
             )
-        self._emit_heartbeat("max_rounds", source="run", total_rounds=self.round_count)
+        self.heartbeat.emit("max_rounds", source="run", total_rounds=self.round_count)
+        self._emit_team_event("run_max_rounds", {"total_rounds": self.round_count})
         return f"已达到最大轮数 ({self.max_rounds})，无法完成任务。"
 
     def _is_substantive_response(self, content: str) -> bool:
@@ -743,8 +881,107 @@ class CodeMateAgent:
         if any(marker in text for marker in final_markers):
             return False
 
-        progress_markers = ("现在进行", "正在", "即将", "接下来", "稍后", "下一步", "将会", "我会")
+        if text.endswith((":", "：")):
+            return True
+
+        progress_markers = (
+            "现在进行",
+            "正在",
+            "即将",
+            "接下来",
+            "稍后",
+            "下一步",
+            "将会",
+            "我会",
+            "立即",
+            "再次执行",
+            "继续执行",
+            "验证",
+            # 英文关键词（LLM 偶尔混合语境回答时使用）
+            "working on",
+            "next step",
+            "I will",
+            "I'll",
+            "about to",
+            "proceeding",
+            "in progress",
+        )
         return any(marker in text for marker in progress_markers)
+
+    def _inject_runtime_warnings(self, query: str) -> None:
+        """按查询内容注入运行时前置告警，避免无效验收。"""
+        text = (query or "").lower()
+        if self.team_enabled:
+            return
+        team_keywords = ("events.jsonl", "inbox_ingested", "background_results", "team_status", "/team")
+        if not any(k in text for k in team_keywords):
+            return
+        warning = (
+            "当前 TEAM runtime 未启用（TEAM_AGENT_ENABLED=false）。"
+            "team_status 将返回 enabled=false，且不会产生 .team/events.jsonl。"
+            "如需验收 team 事件，请在启动前设置 TEAM_AGENT_ENABLED=true 后重试。"
+        )
+        if any(msg.role == "system" and warning in (msg.content or "") for msg in self.messages[-6:]):
+            return
+        self.messages.append(Message(role="system", content=warning))
+        self._emit_progress("runtime_warning", {"message": warning})
+
+    def _build_decision_summary(self, content: str, has_tool_calls: bool = False) -> str:
+        """提取简短决策摘要，供 CLI 进度面板展示。"""
+        import re
+
+        text = (content or "").strip()
+        if not text:
+            return "准备调用工具" if has_tool_calls else ""
+
+        think_match = re.search(r"<think>(.*?)</think>", text, flags=re.DOTALL | re.IGNORECASE)
+        think_text = think_match.group(1).strip() if think_match else ""
+        visible = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE).strip()
+        candidate = visible or think_text
+        if not candidate:
+            return "准备调用工具" if has_tool_calls else ""
+
+        compact = " ".join(candidate.split())
+        if len(compact) > 120:
+            compact = compact[:117] + "..."
+        return compact
+
+    def _summarize_tool_result(self, tool_name: str, result: str) -> str:
+        """压缩工具输出为单行观察，避免 UI 过于嘈杂。"""
+        text = str(result or "").strip()
+        if not text:
+            return "(no output)"
+
+        if tool_name == "todo_write" and "--- TODO UPDATE ---" in text:
+            return "TODO 已更新"
+
+        if tool_name in {"task_create", "task_get", "task_update", "task_cleanup", "team_status"}:
+            try:
+                payload = json.loads(text)
+                if tool_name in {"task_create", "task_get", "task_update"}:
+                    tid = payload.get("id")
+                    status = payload.get("status")
+                    blocked = payload.get("blockedBy", [])
+                    return f"task#{tid} status={status} blockedBy={blocked}"
+                if tool_name == "task_cleanup":
+                    deleted = payload.get("deleted_count", 0)
+                    ns = payload.get("namespace", "")
+                    return f"task_cleanup namespace={ns or 'ALL'} deleted={deleted}"
+                if tool_name == "team_status":
+                    enabled = payload.get("enabled")
+                    inbox_pending = payload.get("inbox_pending", 0)
+                    events_total = payload.get("events_total", 0)
+                    return f"team_status enabled={enabled} inbox={inbox_pending} events={events_total}"
+            except json.JSONDecodeError:
+                pass
+
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        if not lines:
+            return "(no output)"
+        first = lines[0]
+        if len(first) > 120:
+            return first[:117] + "..."
+        return first
 
     def _has_unfinished_plan(self) -> bool:
         """判断当前计划是否仍有未完成任务。"""
@@ -795,18 +1032,16 @@ class CodeMateAgent:
         validation_error = self._validate_arguments(tool_name, arguments)
         if validation_error:
             self.logger.warning(f"参数验证失败: {validation_error}")
-            
-            # 🆕 增加连续失败计数
-            self._consecutive_failures += 1
-            if self._consecutive_failures >= self._max_consecutive_failures:
-                self.logger.error(f"连续 {self._consecutive_failures} 次工具调用失败，建议更换策略")
-            
+
             # 增强错误消息，包含工具正确用法示例
             tool = self.tool_registry.get(tool_name)
             if tool:
                 usage_hint = self._get_tool_usage_hint(tool_name, tool)
-                return f"错误: {validation_error}\n\n{usage_hint}\n\n⚠️ 这是连续第 {self._consecutive_failures} 次失败，请考虑更换方法。"
-            return f"错误: {validation_error}。请提供正确的参数值。（连续第 {self._consecutive_failures} 次失败）"
+                return f"错误: {validation_error}\n\n{usage_hint}"
+            return f"错误: {validation_error}。请提供正确的参数值。"
+
+        if tool_name == "run_shell" and self.team:
+            self.team.sync_shell_context()
 
         # 记录工具调用开始
         self.logger.debug(f"执行工具: {tool_name}")
@@ -871,11 +1106,13 @@ class CodeMateAgent:
                     step=self.round_count,
                 )
 
-            if self.metrics:
-                self.metrics.record_tool_call(tool_name, success=True)
+            # 检查工具返回的字符串是否表示失败（大多数工具通过 return 而非 raise 报错）
+            result_str = str(result)
+            is_error = self.loop_guard.is_error_result(result_str)
 
-            # 🆕 工具执行成功，重置连续失败计数器
-            self._consecutive_failures = 0
+            if self.metrics:
+                self.metrics.record_tool_call(tool_name, success=not is_error)
+            self._emit_team_event("tool_result", {"tool": tool_name, "success": not is_error})
 
             return result
 
@@ -884,9 +1121,6 @@ class CodeMateAgent:
             # LLM 可以根据错误信息决定是否重试或使用其他方法
             error_msg = f"工具执行失败: {e}"
             
-            # 🆕 增加连续失败计数
-            self._consecutive_failures += 1
-
             # 记录错误
             self.logger.error(f"{tool_name} 执行失败: {e}")
 
@@ -904,6 +1138,10 @@ class CodeMateAgent:
             if self.metrics:
                 self.metrics.record_tool_call(tool_name, success=False)
                 self.metrics.record_error()
+            self._emit_team_event(
+                "tool_result",
+                {"tool": tool_name, "success": False, "error": str(e)},
+            )
 
             return error_msg
 
@@ -973,6 +1211,25 @@ class CodeMateAgent:
         
         return None
 
+    def _inject_skill_as_tool_result(self, skill_name: str, skill_content: str, arguments: str = "") -> None:
+        """
+        将 skill 内容以合成 tool result 形式注入 messages。
+
+        这样 skill body 落在 role=tool 消息里，而非 user message。
+        MiniMax 对 2 轮以外的 tool 消息自动降级为普通文本，可被 micro_compact 压缩。
+        """
+        call_id = f"call_skill_{uuid.uuid4().hex[:8]}"
+        synthetic_call = ToolCall(
+            id=call_id,
+            type="function",
+            function=FunctionCall(
+                name="skill",
+                arguments={"action": "load", "skill_name": skill_name, "arguments": arguments},
+            ),
+        )
+        self.messages.append(Message(role="assistant", content="", tool_calls=[synthetic_call]))
+        self.messages.append(Message(role="tool", content=skill_content, tool_call_id=call_id, name="skill"))
+
     def _handle_skill_command(self, query: str) -> Optional[str]:
         """
         处理 skill 命令
@@ -981,7 +1238,7 @@ class CodeMateAgent:
             query: 用户输入，以 / 开头
             
         Returns:
-            处理后的 query（注入了 skill prompt），或 None（不是 skill 命令）
+            原始目标 query（skill 内容已注入为合成 tool result），或 None（不是 skill 命令）
         """
         # 解析命令: /skill-name args
         parts = query[1:].split(maxsplit=1)
@@ -999,29 +1256,62 @@ class CodeMateAgent:
         skill_prompt = self.skill_manager.prepare_execution(skill_name, arguments)
         if not skill_prompt:
             return None
-        
+
         self.logger.info(f"执行 Skill: {skill_name}, 参数: {arguments}")
-        
+
         # 记录 skill 执行事件
         if self.trace_logger:
             self.trace_logger.log_event(
                 TraceEventType.INFO,
-                {"event": "skill_execution", "skill": skill_name, "arguments": arguments},
+                {"event": "skill_execution", "skill": skill_name, "arguments": arguments, "mode": "manual"},
             )
-        
-        # 构造增强的 query：skill 指令 + 原始参数
-        enhanced_query = f"""执行 Skill: {skill_name}
 
-## Skill 指令
+        # 将 skill 内容注入为合成 tool result，返回原始目标
+        self._inject_skill_as_tool_result(skill_name, skill_prompt, arguments)
+        return arguments if arguments else f"按照 {skill_name} skill 的步骤执行"
 
-{skill_prompt}
+    def _should_skip_auto_skill(self, query: str) -> bool:
+        text = (query or "").lower()
+        skip_markers = ("[no-skill]", "不使用skill", "不要用skill", "disable skill auto")
+        return any(marker in text for marker in skip_markers)
 
-## 目标
+    def _try_auto_trigger_skill(self, query: str) -> Optional[tuple[str, str]]:
+        """根据关键词尝试自动触发 skill。"""
+        if not self.skill_auto_trigger_enabled:
+            return None
+        if self._should_skip_auto_skill(query):
+            return None
 
-{arguments if arguments else "按照上述步骤执行"}
-"""
-        
-        return enhanced_query
+        skill_name = self.skill_manager.match_skill_by_keywords(query)
+        if not skill_name or not self.skill_manager.skill_exists(skill_name):
+            return None
+
+        skill_prompt = self.skill_manager.prepare_execution(skill_name, query)
+        if not skill_prompt:
+            return None
+
+        self.logger.info(f"自动触发 Skill: {skill_name}")
+        if self.trace_logger:
+            self.trace_logger.log_event(
+                TraceEventType.INFO,
+                {"event": "skill_execution", "skill": skill_name, "arguments": query, "mode": "auto"},
+            )
+        self._inject_skill_as_tool_result(skill_name, skill_prompt, query)
+        return skill_name, query
+
+    def _ingest_background_notifications(self) -> None:
+        """Direct background notification ingestion when TeamRuntime is not available."""
+        from codemate_agent.tools.shell.background_tasks import drain_background_notifications
+        try:
+            notifications = drain_background_notifications(self.workspace_dir, limit=20)
+        except Exception as e:
+            self.logger.debug(f"读取后台任务通知失败: {e}")
+            return
+        if notifications:
+            payload = json.dumps(notifications, ensure_ascii=False)
+            self.messages.append(
+                Message(role="system", content=f"<background_results>{payload}</background_results>")
+            )
 
     def reset(self):
         """
@@ -1036,14 +1326,15 @@ class CodeMateAgent:
         self._last_usage_tokens = 0
         self._last_reported_total_tokens = 0
         self.loop_detector.reset()  # 重置循环检测器
-        self._loop_count = 0
-        self._consecutive_failures = 0
+        self.loop_guard.reset()
         self._skill_injected = False  # 重置 skill 注入标记
-        # 重置规划器
         if self.planner:
             self.planner.reset()
         # 清理 skill 缓存
         self.skill_manager.clear_cache()
+        if self.team:
+            self.team.reset()
+            self.team.ensure_identity_block(force=True)
 
     def get_stats(self) -> dict:
         """
@@ -1062,13 +1353,7 @@ class CodeMateAgent:
 
     def get_heartbeat_status(self) -> dict:
         """获取心跳状态"""
-        state = self._heartbeat_state.copy()
-        state["age_seconds"] = round(time.time() - state["last_beat_ts"], 2)
-        state["timeout_seconds"] = self.heartbeat_timeout_seconds
-        state["enabled"] = self.heartbeat_enabled
-        state["mode"] = self.heartbeat_mode
-        state["idle_seconds"] = round(time.time() - self._last_activity_ts, 2)
-        return state
+        return self.heartbeat.get_status()
 
     def load_session(self, messages: list[dict]) -> None:
         """
@@ -1121,140 +1406,50 @@ class CodeMateAgent:
                 # 回调异常不应影响主流程
                 self.logger.debug(f"进度回调异常: {e}")
 
-    def _emit_heartbeat(self, phase: str, source: str = "", **extra) -> None:
-        """记录并发射心跳事件"""
-        if not self.heartbeat_enabled:
+    def _emit_team_event(self, event: str, payload: Optional[dict[str, Any]] = None) -> None:
+        """写入结构化团队事件日志。"""
+        if not self.team:
             return
-        # 默认简化模式：只保留任务驱动轮询和关键告警事件
-        if (not self.heartbeat_verbose) and source != "worker":
-            key_phases = {"completed", "max_rounds", "watchdog_alert", "todo_nudge"}
-            if phase not in key_phases:
-                return
-        now = time.time()
-        self._heartbeat_state["phase"] = phase
-        self._heartbeat_state["last_beat_ts"] = now
-        self._heartbeat_state["beats"] += 1
-        self._heartbeat_state["last_tool"] = extra.get("tool", self._heartbeat_state["last_tool"])
-        self._heartbeat_state["stalled"] = extra.get("stalled", self._heartbeat_state["stalled"])
-        if extra.get("alert"):
-            self._heartbeat_state["last_alert"] = extra.get("message", "")
+        self.team.emit_event(event, payload or {})
 
-        payload = {
-            "ts": now,
-            "session_id": self._heartbeat_state["session_id"],
-            "phase": phase,
-            "source": source,
-            "round": self.round_count,
-            "message_count": len(self.messages),
-            "total_tokens": self.total_tokens,
-            "last_tool": self._heartbeat_state["last_tool"],
-            "stalled": self._heartbeat_state["stalled"],
-            **extra,
-        }
-
-        if source != "worker":
-            self._last_activity_ts = now
-
-        try:
-            with open(self._heartbeat_file, "a", encoding="utf-8") as f:
-                f.write(json.dumps(payload, ensure_ascii=False) + "\n")
-        except Exception as e:
-            self.logger.debug(f"写入心跳日志失败: {e}")
-
-        self._emit_progress("heartbeat", payload)
-
-    def _check_heartbeat_timeout(self, operation: str, duration_ms: float) -> None:
-        """超时检测，触发心跳告警"""
-        if not self.heartbeat_enabled:
-            return
-        timeout_ms = self.heartbeat_timeout_seconds * 1000
-        if duration_ms <= timeout_ms:
-            return
-        message = (
-            f"心跳告警: {operation} 执行耗时 {duration_ms/1000:.2f}s，"
-            f"超过阈值 {self.heartbeat_timeout_seconds}s"
-        )
-        self.logger.warning(message)
-        self._emit_heartbeat(
-            "watchdog_alert",
-            source="watchdog",
-            alert=True,
-            stalled=True,
-            operation=operation,
-            duration_ms=round(duration_ms, 2),
-            message=message,
-        )
-        self._emit_progress("heartbeat_alert", {"operation": operation, "duration_ms": round(duration_ms, 2)})
-
-    def _start_heartbeat_worker(self) -> None:
-        """启动后台心跳线程：周期性检查待办状态"""
-        if not self.heartbeat_enabled or self.heartbeat_poll_seconds <= 0:
-            return
-
-        def _worker_loop() -> None:
-            while not self._heartbeat_stop_event.is_set():
-                self._heartbeat_stop_event.wait(self.heartbeat_poll_seconds)
-                if self._heartbeat_stop_event.is_set():
-                    break
-                self._heartbeat_pending_check_once()
-
-        self._heartbeat_thread = threading.Thread(
-            target=_worker_loop,
-            name="codemate-heartbeat",
-            daemon=True,
-        )
-        self._heartbeat_thread.start()
-
-    def _heartbeat_pending_check_once(self) -> None:
-        """
-        周期检查待办事项。
-        心跳不直接修改消息上下文，只做观测和提醒事件发射。
-        """
-        from codemate_agent.tools.todo.todo_write import TodoWriteTool
-
-        todo_state = TodoWriteTool.get_current_state()
-        pending = 0
-        in_progress = 0
-        if todo_state:
-            stats = todo_state.get("stats", {})
-            pending = int(stats.get("pending", 0))
-            in_progress = int(stats.get("in_progress", 0))
-
-        now = time.time()
-        idle_seconds = now - self._last_activity_ts
-        self._heartbeat_state["last_todo_check_ts"] = now
-        self._heartbeat_state["pending_todos"] = pending + in_progress
-
-        self._emit_heartbeat(
-            "heartbeat_tick",
-            source="worker",
-            pending_todos=pending,
-            in_progress_todos=in_progress,
-            idle_seconds=round(idle_seconds, 2),
+    def send_team_message(
+        self,
+        to: str,
+        content: str,
+        *,
+        msg_type: str = "message",
+        request_id: Optional[str] = None,
+        extra: Optional[dict[str, Any]] = None,
+    ) -> Optional[dict[str, Any]]:
+        if not self.team:
+            return None
+        return self.team.send_message(
+            to=to,
+            content=content,
+            msg_type=msg_type,
+            request_id=request_id,
+            extra=extra,
         )
 
-        if (
-            self._todo_nag_enabled
-            and (pending + in_progress) > 0
-            and idle_seconds > self.heartbeat_timeout_seconds
-        ):
-            message = (
-                f"检测到待办未清空（pending={pending}, in_progress={in_progress}），"
-                f"且空闲 {idle_seconds:.1f}s"
-            )
-            self._emit_heartbeat(
-                "todo_nudge",
-                source="worker",
-                alert=True,
-                message=message,
-                pending_todos=pending,
-                in_progress_todos=in_progress,
-                idle_seconds=round(idle_seconds, 2),
-            )
-            self._emit_progress(
-                "heartbeat_todo_nudge",
-                {"pending": pending, "in_progress": in_progress, "idle_seconds": round(idle_seconds, 2)},
-            )
+    def get_team_status(self) -> dict[str, Any]:
+        if not self.team:
+            return {"enabled": False}
+        return self.team.get_status()
+
+    @property
+    def message_bus(self):
+        """Proxy to TeamRuntime.message_bus for backwards compatibility."""
+        return self.team.message_bus if self.team else None
+
+    def peek_team_inbox(self, limit: int = 20) -> list[dict[str, Any]]:
+        if not self.team:
+            return []
+        return self.team.peek_inbox(limit=limit)
+
+    def list_task_board(self, limit: int = 50) -> list[dict[str, Any]]:
+        if not self.team:
+            return []
+        return self.team.list_task_board(limit=limit)
 
     def _format_args_for_display(self, arguments: dict) -> str:
         """
@@ -1361,7 +1556,7 @@ class CodeMateAgent:
             return "|".join(key_parts)
         except Exception as e:
             # 如果签名生成失败，返回一个简单的签名
-            self.logger.warning(f"签名生成失败 [{tool_name}]: {e}")
+            self.logger.warning(f"签名生成失败 '{tool_name}': {e}")
             return f"{tool_name}|error"
 
     def _is_stuck_in_loop(self) -> bool:
@@ -1422,6 +1617,44 @@ class CodeMateAgent:
                                  "- file_path: 目标文件路径\n"
                                  "- chunks: 字符串数组（每块建议 <= 3000 字符）\n"
                                  "示例: append_file_chunks(file_path='site/index.html', chunks=['后续内容'])",
+            "task_create": "task_create 使用方法:\n"
+                           "- subject: 任务标题（必填）\n"
+                           "- description: 任务描述（可选）\n"
+                           "- blocked_by / blocks: 依赖关系（可选）\n"
+                           "- namespace: 命名空间（可选，如 ITEST）\n"
+                           "示例: task_create(subject='重构认证模块', description='拆分 service 层', namespace='ITEST')",
+            "task_get": "task_get 使用方法:\n"
+                        "- task_id: 任务 ID（整数）\n"
+                        "示例: task_get(task_id=1)",
+            "task_update": "task_update 使用方法:\n"
+                           "- task_id: 任务 ID（整数，必填）\n"
+                           "- status: pending|in_progress|completed|cancelled（可选）\n"
+                           "- owner: 负责人（可选）\n"
+                           "- add_blocked_by / add_blocks: 依赖关系（可选）\n"
+                           "示例: task_update(task_id=1, status='completed')",
+            "task_cleanup": "task_cleanup 使用方法:\n"
+                            "- namespace: 命名空间前缀删除（可选）\n"
+                            "- all_tasks: 是否清空全部任务（可选，默认 false）\n"
+                            "示例: task_cleanup(namespace='ITEST') 或 task_cleanup(all_tasks=true)",
+            "team_status": "team_status 使用方法:\n"
+                           "- event_limit: 最近事件条数（可选，默认 10）\n"
+                           "示例: team_status(event_limit=20)",
+            "background_run": "background_run 使用方法:\n"
+                              "- command: 后台执行的命令（必填）\n"
+                              "- timeout: 超时秒数（可选，默认 120）\n"
+                              "- allow_parallel: 是否允许与当前后台任务并行（可选，默认 false）\n"
+                              "示例: background_run(command='pytest -q', timeout=180, allow_parallel=false)",
+            "check_background": "check_background 使用方法:\n"
+                                "- task_id: 可选，指定任务 ID 查看详情\n"
+                                "示例: check_background(task_id='abcd1234') 或 check_background()",
+            "memory_write": "memory_write 使用方法:\n"
+                            "- content: 要记住的内容（字符串，最多 500 字，必填）\n"
+                            "- category: 分类，必须是 'preference' / 'project' / 'finding' 之一（必填）\n"
+                            "示例: memory_write(content='用户偏好用 dataclass', category='preference')",
+            "memory_read": "memory_read 使用方法:\n"
+                           "- query: 检索关键词（字符串，必填）\n"
+                           "- top_k: 返回结果数（可选，默认 3，最大 5）\n"
+                           "示例: memory_read(query='测试框架', top_k=3)",
         }
 
         if tool_name in hints:

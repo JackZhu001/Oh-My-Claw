@@ -27,3 +27,17 @@ def test_print_error_keeps_literal_brackets(monkeypatch):
 
     output = stream.getvalue()
     assert "[/TOOL_CALL]" in output
+
+
+def test_canonical_confirm_response_accepts_repeated_keys():
+    assert cli._canonical_confirm_response("yyyyy") == "y"
+    assert cli._canonical_confirm_response("aaaa") == "a"
+    assert cli._canonical_confirm_response("no") == "n"
+    assert cli._canonical_confirm_response("quit") == "q"
+    assert cli._canonical_confirm_response("maybe") == "maybe"
+
+
+def test_should_auto_confirm_applies_to_shell_tools():
+    state = {"auto_confirm": True}
+    assert cli._should_auto_confirm(state, "run_shell") is True
+    assert cli._should_auto_confirm(state, "background_run") is True

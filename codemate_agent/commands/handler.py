@@ -49,6 +49,9 @@ def handle_command(
         "/reset": lambda: _handle_reset(agent),
         "/compact": lambda: _handle_compact(agent),
         "/heartbeat": lambda: _handle_heartbeat(agent),
+        "/team": lambda: _handle_team(agent),
+        "/inbox": lambda: _handle_inbox(agent),
+        "/tasks": lambda: _handle_tasks(agent),
         "/stats": lambda: _handle_stats(agent),
         "/tools": lambda: _handle_tools(agent),
         "/skills": lambda: _handle_skills(agent),
@@ -117,6 +120,65 @@ def _handle_heartbeat(agent: "CodeMateAgent") -> None:
         f"  mode: {status.get('mode')}\n"
         f"  status: {state}\n"
     )
+
+
+def _handle_team(agent: "CodeMateAgent") -> None:
+    """处理 /team 命令"""
+    getter = getattr(agent, "get_team_status", None)
+    if getter is None:
+        print_error("当前 Agent 不支持团队状态")
+        return
+    status = getter()
+    if not status.get("enabled"):
+        console.print("[yellow]团队运行时未启用（TEAM_AGENT_ENABLED=false）[/yellow]\n")
+        return
+    console.print(
+        "[cyan]团队状态:[/cyan]\n"
+        f"  team: {status.get('team_name')}\n"
+        f"  agent: {status.get('agent_name')} ({status.get('agent_role')})\n"
+        f"  active_task_id: {status.get('active_task_id')}\n"
+        f"  inbox_pending: {status.get('inbox_pending')}\n"
+        f"  task_stats: {status.get('task_stats')}\n"
+        f"  request_tracker: {status.get('request_tracker', {}).get('counts', {})}\n"
+    )
+
+
+def _handle_inbox(agent: "CodeMateAgent") -> None:
+    """处理 /inbox 命令"""
+    getter = getattr(agent, "peek_team_inbox", None)
+    if getter is None:
+        print_error("当前 Agent 不支持 inbox 查看")
+        return
+    messages = getter(limit=20)
+    if not messages:
+        console.print("[yellow]inbox 为空[/yellow]\n")
+        return
+    console.print("[cyan]最近 inbox 消息（最多 20 条）:[/cyan]")
+    for idx, msg in enumerate(messages, 1):
+        console.print(
+            f"  {idx:02d}. [{msg.get('type', 'message')}] "
+            f"{msg.get('from', '?')} -> {msg.get('content', '')[:120]}"
+        )
+    console.print("")
+
+
+def _handle_tasks(agent: "CodeMateAgent") -> None:
+    """处理 /tasks 命令"""
+    getter = getattr(agent, "list_task_board", None)
+    if getter is None:
+        print_error("当前 Agent 不支持任务板查看")
+        return
+    tasks = getter(limit=50)
+    if not tasks:
+        console.print("[yellow]任务板为空[/yellow]\n")
+        return
+    console.print("[cyan]任务板:[/cyan]")
+    for task in tasks:
+        marker = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}.get(task.get("status"), "[?]")
+        owner = f" @{task.get('owner')}" if task.get("owner") else ""
+        worktree = f" ({task.get('worktree')})" if task.get("worktree") else ""
+        console.print(f"  {marker} #{task.get('id')}: {task.get('subject', '')}{owner}{worktree}")
+    console.print("")
 
 
 def _handle_stats(agent: "CodeMateAgent") -> None:

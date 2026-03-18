@@ -60,15 +60,25 @@ class AppendFileChunksTool(Tool):
             return "错误: chunks 不能为空，且必须是字符串数组"
         if not all(isinstance(c, str) for c in chunks):
             return "错误: chunks 必须全部是字符串"
-        if any(len(c) > self.MAX_CHUNK_CHARS for c in chunks):
-            return f"错误: 单个 chunk 超过限制（{self.MAX_CHUNK_CHARS} 字符），请继续拆分"
+        # 自动拆分超长 chunk，避免来回失败
+        normalized_chunks: List[str] = []
+        split_count = 0
+        for chunk in chunks:
+            if len(chunk) <= self.MAX_CHUNK_CHARS:
+                normalized_chunks.append(chunk)
+                continue
+            for i in range(0, len(chunk), self.MAX_CHUNK_CHARS):
+                normalized_chunks.append(chunk[i:i + self.MAX_CHUNK_CHARS])
+                split_count += 1
+        chunks = normalized_chunks
 
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             content = "".join(chunks)
             with open(path, "a", encoding="utf-8") as f:
                 f.write(content)
-            return f"已成功分块追加文件: {file_path}（{len(chunks)} 块，{len(content)} 字符）"
+            suffix = f"，自动拆分 {split_count} 段" if split_count else ""
+            return f"已成功分块追加文件: {file_path}（{len(chunks)} 块，{len(content)} 字符{suffix}）"
         except PermissionError:
             return f"错误: 权限不足，无法写入文件: {file_path}"
         except Exception as e:

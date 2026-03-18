@@ -15,7 +15,7 @@ from codemate_agent.tools.registry import ToolRegistry
 
 
 # 工具类别目录
-_TOOL_CATEGORIES = ["file", "search", "shell", "todo", "task", "skill", "compact"]
+_TOOL_CATEGORIES = ["file", "search", "shell", "todo", "task", "skill", "compact", "memory"]
 
 
 def _discover_tools(workspace_dir: Optional[str] = None) -> List[Tool]:

@@ -33,6 +33,9 @@ def print_help() -> None:
   [cyan]/reset[/cyan]      - 重置 Agent 状态
   [cyan]/compact[/cyan]    - 手动压缩当前上下文
   [cyan]/heartbeat[/cyan]  - 查看心跳与看门狗状态
+  [cyan]/team[/cyan]       - 查看团队运行时状态
+  [cyan]/inbox[/cyan]      - 查看团队消息 inbox（不清空）
+  [cyan]/tasks[/cyan]      - 查看任务板状态
   [cyan]/stats[/cyan]      - 显示统计信息
   [cyan]/tools[/cyan]      - 列出可用工具
   [cyan]/skills[/cyan]     - 列出可用 Skills

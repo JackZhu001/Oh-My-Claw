@@ -98,6 +98,7 @@ class SkillManager:
         self._index: dict[str, str] = {}  # name -> description
         self._skill_dirs: dict[str, Path] = {}  # name -> skill directory
         self._cache: dict[str, Skill] = {}  # 完整内容缓存
+        self._trigger_rules: list[dict] = []  # frontmatter-driven keyword rules
         self._build_index()
     
     def _build_index(self) -> None:
@@ -105,6 +106,7 @@ class SkillManager:
         if not self.skills_dir.exists():
             return
         
+        trigger_rules = []
         # 新结构: skills/skill-name/SKILL.md
         for skill_dir in self.skills_dir.iterdir():
             if not skill_dir.is_dir():
@@ -115,13 +117,30 @@ class SkillManager:
                 continue
             
             with open(skill_file, "r", encoding="utf-8") as f:
-                header = f.read(1500)
+                header = f.read(3000)  # 增大读取量以支持含 trigger 字段的 frontmatter
             
             meta = self._parse_frontmatter(header)
             if meta.get("name"):
                 name = meta["name"]
                 self._index[name] = meta.get("description", "")
                 self._skill_dirs[name] = skill_dir
+
+                # 解析 trigger_* 字段，构建自动触发规则
+                if meta.get("trigger_keywords"):
+                    keywords = [k.strip() for k in meta["trigger_keywords"].split("\n") if k.strip()]
+                    negative = [k.strip() for k in meta.get("trigger_negative", "").split("\n") if k.strip()]
+                    required_intent = [k.strip() for k in meta.get("trigger_required_intent", "").split("\n") if k.strip()]
+                    trigger_rules.append({
+                        "skill": name,
+                        "keywords": keywords,
+                        "negative": negative,
+                        "min_hits": int(meta.get("trigger_min_hits", "1")),
+                        "required_intent_keywords": required_intent,
+                        "priority": int(meta.get("trigger_priority", "99")),
+                    })
+
+        # 按 priority 排序（数字小 = 优先级高）
+        self._trigger_rules = sorted(trigger_rules, key=lambda r: r["priority"])
     
     def _parse_frontmatter(self, text: str) -> dict:
         """解析 YAML frontmatter（支持多行值）"""
@@ -212,7 +231,7 @@ class SkillManager:
     
     def match_skill_by_keywords(self, user_input: str) -> Optional[str]:
         """
-        基于用户输入关键词自动匹配 Skill
+        基于用户输入关键词自动匹配 Skill（规则来自各 skill frontmatter 的 trigger_* 字段）
         
         Args:
             user_input: 用户输入文本
@@ -222,51 +241,20 @@ class SkillManager:
         """
         user_input_lower = user_input.lower()
         
-        # 定义关键词映射（优先级从高到低）
-        keyword_rules = [
-            # ui-ux-pro-max 触发词
-            {
-                "skill": "ui-ux-pro-max",
-                "keywords": [
-                    # 明确提及 UI/UX
-                    "ui", "ux", "ui/ux", "界面", "用户体验",
-                    # 设计相关
-                    "设计", "design", "样式", "style", "风格",
-                    # 网页相关
-                    "网页", "webpage", "html", "css", "landing",
-                    "dashboard", "仪表盘", "落地页",
-                    # 视觉相关
-                    "配色", "color", "palette", "字体", "font",
-                    "typography", "排版", "布局", "layout",
-                    # 组件相关
-                    "button", "modal", "navbar", "sidebar", "card",
-                    # 风格关键词
-                    "glassmorphism", "minimalism", "dark mode",
-                    "响应式", "responsive", "美化", "美观",
-                ],
-                "negative": ["code review", "代码审查"],  # 排除词
-            },
-            # code-review 触发词
-            {
-                "skill": "code-review",
-                "keywords": [
-                    "code review", "代码审查", "审查代码", "review代码",
-                    "检查代码", "代码质量", "代码问题", "安全审查",
-                    "找漏洞", "漏洞", "安全检查", "review 一下",
-                ],
-                "negative": [],
-            },
-        ]
-        
-        for rule in keyword_rules:
+        for rule in self._trigger_rules:
             # 检查排除词
             if any(neg in user_input_lower for neg in rule["negative"]):
                 continue
-            
-            # 检查触发词
-            for keyword in rule["keywords"]:
-                if keyword in user_input_lower:
-                    return rule["skill"]
+
+            matched_count = sum(1 for keyword in rule["keywords"] if keyword in user_input_lower)
+            if matched_count < rule["min_hits"]:
+                continue
+
+            required_intent = rule.get("required_intent_keywords", [])
+            if required_intent and not any(word in user_input_lower for word in required_intent):
+                continue
+
+            return rule["skill"]
         
         return None
     
