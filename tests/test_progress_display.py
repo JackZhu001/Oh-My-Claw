@@ -100,3 +100,38 @@ def test_progress_display_shows_skill_auto_selected_hint():
     output = stream.getvalue()
     assert "自动 Skill: ui-ux-pro-max" in output
     assert "[no-skill]" in output
+
+
+def test_progress_display_shows_repo_rag_summary():
+    stream = io.StringIO()
+    console = Console(file=stream, force_terminal=False, color_system=None)
+    display = ProgressDisplay(console)
+
+    display.on_event(
+        "repo_rag_retrieved",
+        {"chunks": 3, "source_count": 2, "total_chars": 1200},
+    )
+
+    output = stream.getvalue()
+    assert "RepoRAG" in output
+    assert "3 个片段" in output
+
+
+def test_progress_display_task_member_label_for_team_dispatch():
+    stream = io.StringIO()
+    console = Console(file=stream, force_terminal=False, color_system=None)
+    display = ProgressDisplay(console)
+
+    display.on_event("round_start", {"round": 1, "max_rounds": 50})
+    display.on_event(
+        "tool_call_start",
+        {
+            "tool": "task",
+            "args": "description=收集项目事实",
+            "arguments": {"agent_id": "researcher", "description": "收集项目事实"},
+        },
+    )
+
+    output = stream.getvalue()
+    assert "阶段: 团队委托" in output
+    assert "task[member:researcher]" in output

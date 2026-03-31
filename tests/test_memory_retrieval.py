@@ -45,6 +45,9 @@ def test_system_prompt_includes_codemate_and_retrieved_memory(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir(parents=True, exist_ok=True)
     (workspace / "codemate.md").write_text("# CodeMate 项目记忆\n\n- 用户偏好：简洁回答", encoding="utf-8")
+    docs_dir = workspace / "docs"
+    docs_dir.mkdir()
+    (docs_dir / "deploy.md").write_text("# 部署说明\n\n## Kubernetes\n使用 Kubernetes 部署生产环境。", encoding="utf-8")
 
     agent = CodeMateAgent(
         llm_client=DummyLLM(),
@@ -55,5 +58,25 @@ def test_system_prompt_includes_codemate_and_retrieved_memory(tmp_path):
         planning_enabled=False,
     )
     prompt = agent._get_system_prompt("kubernetes 怎么部署")
-    assert "项目记忆（codemate.md）" in prompt
+    assert "RepoRAG 项目上下文" in prompt
+    assert "docs/deploy.md" in prompt
     assert "Kubernetes" in prompt or "kubernetes" in prompt
+
+
+def test_system_prompt_skips_repo_rag_for_greeting(tmp_path):
+    memory = MemoryManager(tmp_path / "memory")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
+    (workspace / "codemate.md").write_text("# CodeMate 项目记忆\n\n- 规则", encoding="utf-8")
+
+    agent = CodeMateAgent(
+        llm_client=DummyLLM(),
+        tools=[],
+        workspace_dir=str(workspace),
+        memory_manager=memory,
+        compression_enabled=False,
+        planning_enabled=False,
+    )
+    prompt = agent._get_system_prompt("hello")
+    assert "RepoRAG 项目上下文" not in prompt
+    assert str(workspace) in prompt

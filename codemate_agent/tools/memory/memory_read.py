@@ -1,8 +1,5 @@
 """
-Memory Read 工具 - 主动查询长期记忆
-
-Agent 可通过此工具在需要时按关键词检索长期记忆，
-补充 system prompt 中未自动注入的内容。
+Memory Read 工具 - 主动查询项目记忆与 RepoRAG 上下文。
 """
 
 from __future__ import annotations
@@ -16,16 +13,18 @@ class MemoryReadTool(Tool):
     """
     长期记忆检索工具
 
-    基于 BM25 关键词检索，返回最相关的记忆片段。
-    使用 ClassVar 存储 MemoryManager 引用，由 Agent 初始化时注入。
+    优先通过 RepoRAG 检索项目记忆、文档与长期记忆片段。
+    使用 ClassVar 存储依赖，由 Agent 初始化时注入。
     """
 
     _memory_manager: ClassVar[Optional[Any]] = None  # MemoryManager
+    _repo_rag: ClassVar[Optional[Any]] = None  # RepoRAG
 
     @classmethod
-    def set_dependencies(cls, memory_manager: Any) -> None:
+    def set_dependencies(cls, memory_manager: Any, repo_rag: Any = None) -> None:
         """注入 MemoryManager 依赖（由 Agent.__init__ 调用）"""
         cls._memory_manager = memory_manager
+        cls._repo_rag = repo_rag
 
     @property
     def name(self) -> str:
@@ -33,7 +32,7 @@ class MemoryReadTool(Tool):
 
     @property
     def description(self) -> str:
-        return """按关键词检索长期记忆，返回最相关的片段。
+        return """按关键词检索项目记忆与长期记忆，返回最相关的片段。
 
 何时调用：
 - 用户问到"上次"、"之前说的"、"你记得吗"等涉及历史信息的问题
@@ -72,13 +71,17 @@ class MemoryReadTool(Tool):
         if not query:
             return "❌ memory_read 错误：query 不能为空"
 
-        if MemoryReadTool._memory_manager is None:
-            return "❌ memory_read 错误：MemoryManager 未初始化（请确认记忆功能已启用）"
+        if MemoryReadTool._repo_rag is None and MemoryReadTool._memory_manager is None:
+            return "❌ memory_read 错误：检索层未初始化（请确认记忆功能已启用）"
 
         try:
-            result = MemoryReadTool._memory_manager.retrieve_relevant_memory(
-                query, top_k=top_k
-            )
+            if MemoryReadTool._repo_rag is not None:
+                context = MemoryReadTool._repo_rag.retrieve(query, top_k=top_k)
+                result = context.to_prompt_text()
+            else:
+                result = MemoryReadTool._memory_manager.retrieve_relevant_memory(
+                    query, top_k=top_k
+                )
             return result or "📭 未找到相关记忆"
         except Exception as e:
             return f"❌ memory_read 检索失败：{e}"

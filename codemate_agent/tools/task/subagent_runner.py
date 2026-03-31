@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -53,6 +54,14 @@ DENIED_TOOLS = frozenset({
     "task",  # 防止递归
 })
 
+WRITE_TOOLS = frozenset({
+    "write_file",
+    "append_file",
+    "write_file_chunks",
+    "append_file_chunks",
+    "edit_file",
+})
+
 
 # ============================================================================
 # 数据结构
@@ -95,14 +104,17 @@ class TaskResponse:
 
     def to_text(self) -> str:
         """转换为文本格式（用于 LLM 消费）"""
+        subagent_type = str(self.data.get("subagent_type", "unknown"))
         lines = [
             f"--- TASK RESULT ---",
             f"状态: {self.status}",
-            f"子代理类型: {self.data.get('subagent_type', 'unknown')}",
+            f"子代理类型: {subagent_type}",
             f"模型: {self.data.get('model_used', 'unknown')}",
             f"执行步数: {self.stats.get('tool_calls', 0)}",
             f"耗时: {self.stats.get('time_ms', 0)}ms",
         ]
+        if subagent_type.startswith("team:"):
+            lines.append(f"团队成员: {subagent_type.split(':', 1)[1]}")
 
         tool_summary = self.data.get("tool_summary", [])
         if tool_summary:
@@ -134,6 +146,7 @@ class SubagentRunner:
     # 循环检测配置
     MAX_RECENT_CALLS = 5
     LOOP_THRESHOLD = 3  # 连续相同调用次数阈值
+    DEFAULT_INLINE_FILE_CHARS = 1800
 
     def __init__(
         self,
@@ -142,11 +155,26 @@ class SubagentRunner:
         subagent_type: str = "general",
         max_steps: int = 15,
         workspace_dir: Path = None,
+        allowed_tools: Optional[set[str]] = None,
+        denied_tools: Optional[set[str]] = None,
+        system_prompt_override: Optional[str] = None,
     ):
         self.llm = llm_client
         self.subagent_type = subagent_type
         self.max_steps = max_steps
         self.workspace_dir = Path(workspace_dir) if workspace_dir else Path.cwd()
+        self.allowed_tools = set(allowed_tools) if allowed_tools else set(ALLOWED_TOOLS)
+        if denied_tools is not None:
+            self.denied_tools = set(denied_tools)
+        elif allowed_tools is not None:
+            # 显式传入 allowed_tools 时，避免默认拒绝列表误伤（例如 team-builder 需要写文件工具）。
+            self.denied_tools = set()
+        else:
+            self.denied_tools = set(DENIED_TOOLS)
+        self.system_prompt_override = system_prompt_override or ""
+        self.max_inline_file_chars = int(
+            os.getenv("SUBAGENT_MAX_INLINE_FILE_CHARS", str(self.DEFAULT_INLINE_FILE_CHARS))
+        )
 
         # 创建受限的工具注册器
         self.tool_registry = self._create_filtered_registry(tool_registry)
@@ -160,6 +188,8 @@ class SubagentRunner:
         # 循环检测
         self._recent_calls: List[str] = []
         self._loop_warnings = 0
+        self._write_tool_failures = 0
+        self._write_failover_injected = False
 
     def _create_filtered_registry(self, full_registry: ToolRegistry) -> ToolRegistry:
         """创建受限的工具注册器"""
@@ -167,9 +197,9 @@ class SubagentRunner:
 
         for tool in full_registry.get_all().values():
             tool_name = tool.name
-            if tool_name in DENIED_TOOLS:
+            if tool_name in self.denied_tools:
                 continue
-            if tool_name in ALLOWED_TOOLS:
+            if tool_name in self.allowed_tools:
                 filtered.register(tool)
 
         logger.debug(f"子代理工具过滤: {list(filtered.list_tools())}")
@@ -177,17 +207,20 @@ class SubagentRunner:
 
     def run(self, task_description: str, task_prompt: str) -> SubagentResult:
         """运行子代理"""
-        try:
-            role_prompt = get_subagent_prompt(self.subagent_type)
-        except ValueError as e:
-            return SubagentResult(
-                success=False,
-                content=str(e),
-                tool_usage={},
-                steps_taken=0,
-                subagent_type=self.subagent_type,
-                error=str(e),
-            )
+        if self.system_prompt_override:
+            role_prompt = self.system_prompt_override
+        else:
+            try:
+                role_prompt = get_subagent_prompt(self.subagent_type)
+            except ValueError as e:
+                return SubagentResult(
+                    success=False,
+                    content=str(e),
+                    tool_usage={},
+                    steps_taken=0,
+                    subagent_type=self.subagent_type,
+                    error=str(e),
+                )
 
         system_prompt = f"{role_prompt}\n\n# 当前任务\n{task_description}"
         self.messages = [
@@ -244,6 +277,23 @@ class SubagentRunner:
                         tool_call_id=tool_call.id,
                         name=tool_call.function.name,
                     ))
+                    if (
+                        not self._write_failover_injected
+                        and "写文件工具已连续失败2次" in tool_result
+                    ):
+                        self._write_failover_injected = True
+                        self.messages.append(
+                            Message(
+                                role="system",
+                                content=(
+                                    "写文件工具已连续失败2次。立即降级为："
+                                    "1) 先用 write_file_chunks 写最小 HTML 骨架；"
+                                    "2) 再用 append_file_chunks 按章节追加；"
+                                    f"3) 每个 chunk <= {self.max_inline_file_chars} 字符；"
+                                    "4) 不要重复同一失败调用。"
+                                ),
+                            )
+                        )
             else:
                 logger.info(f"子代理完成，共 {step + 1} 步")
                 return SubagentResult(
@@ -269,6 +319,7 @@ class SubagentRunner:
     def _execute_tool_call(self, tool_call) -> str:
         tool_name = tool_call.function.name
         arguments = tool_call.function.arguments
+        tool_name, arguments = self._normalize_file_write_call(tool_name, arguments)
 
         logger.debug(f"子代理执行工具: {tool_name}")
 
@@ -278,17 +329,69 @@ class SubagentRunner:
         if validation_error:
             logger.warning(f"子代理参数验证失败: {validation_error}")
             hint = ArgumentValidator.get_usage_hint(tool_name)
-            return f"参数错误: {validation_error}\n正确用法: {hint}"
+            return self._format_tool_param_error(tool_name, validation_error, hint)
 
         self.tool_usage[tool_name] = self.tool_usage.get(tool_name, 0) + 1
 
         try:
             result = self.tool_registry.execute(tool_name, **fixed_args)
-            return str(result)
+            result_text = str(result)
+            if tool_name in WRITE_TOOLS and self._looks_like_error_result(result_text):
+                self._write_tool_failures += 1
+            elif tool_name in WRITE_TOOLS:
+                self._write_tool_failures = 0
+            return result_text
         except Exception as e:
             error_msg = f"工具执行失败: {e}"
             logger.error(error_msg)
+            if tool_name in WRITE_TOOLS:
+                self._write_tool_failures += 1
             return error_msg
+
+    def _normalize_file_write_call(self, tool_name: str, arguments: Any) -> tuple[str, Any]:
+        if tool_name not in {"write_file", "append_file"}:
+            return tool_name, arguments
+        if not isinstance(arguments, dict):
+            return tool_name, arguments
+
+        file_path = arguments.get("file_path")
+        content = arguments.get("content")
+        if not isinstance(file_path, str) or not file_path.strip():
+            return tool_name, arguments
+        if not isinstance(content, str) or len(content) <= self.max_inline_file_chars:
+            return tool_name, arguments
+
+        chunk_tool = "write_file_chunks" if tool_name == "write_file" else "append_file_chunks"
+        chunks = [
+            content[i:i + self.max_inline_file_chars]
+            for i in range(0, len(content), self.max_inline_file_chars)
+        ]
+        logger.info(
+            "子代理自动转换超长写入: %s -> %s (%s chars, %s chunks)",
+            tool_name,
+            chunk_tool,
+            len(content),
+            len(chunks),
+        )
+        return chunk_tool, {"file_path": file_path, "chunks": chunks}
+
+    def _format_tool_param_error(self, tool_name: str, validation_error: str, hint: str) -> str:
+        if tool_name in WRITE_TOOLS:
+            self._write_tool_failures += 1
+            failover = ""
+            if self._write_tool_failures >= 2:
+                failover = (
+                    f"\n写文件工具已连续失败2次，立即降级："
+                    f"先骨架，再 append_file_chunks，每块 <= {self.max_inline_file_chars} 字符。"
+                )
+            return f"参数错误: {validation_error}\n正确用法: {hint}{failover}"
+        return f"参数错误: {validation_error}\n正确用法: {hint}"
+
+    @staticmethod
+    def _looks_like_error_result(text: str) -> bool:
+        probe = (text or "").lower()
+        markers = ("错误", "error", "failed", "traceback", "参数错误")
+        return any(marker in probe for marker in markers)
 
     def _detect_loop(self, tool_calls) -> bool:
         signatures = []

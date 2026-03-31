@@ -50,8 +50,7 @@ def test_parse_command_segments_respects_quoted_operators(tmp_path):
     assert segments[1][1] == "done"
 
 
-def test_run_shell_supports_bash_lc_with_quoted_chain(tmp_path):
+def test_run_shell_blocks_inline_wrapper_execution(tmp_path):
     tool = RunShellTool(workspace_dir=str(tmp_path))
     result = tool.run('bash -lc "echo hello && echo world"')
-    assert "hello" in result
-    assert "world" in result
+    assert "inline wrapper" in result

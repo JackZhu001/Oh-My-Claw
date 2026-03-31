@@ -152,3 +152,20 @@ class TestMemoryReadTool:
         result = read_tool.run(query="item", top_k=100)
         # 只需不报错即可
         assert isinstance(result, str)
+
+    def test_read_uses_repo_rag_for_workspace_docs(self, memory, tmp_path):
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        (workspace / "codemate.md").write_text(
+            "# CodeMate 项目记忆\n\n## 关键约定\n- 使用 Kubernetes 部署\n",
+            encoding="utf-8",
+        )
+        from codemate_agent.retrieval import RepoRAG
+
+        repo_rag = RepoRAG(workspace_dir=workspace, memory_manager=memory)
+        MemoryReadTool.set_dependencies(memory_manager=memory, repo_rag=repo_rag)
+        tool = MemoryReadTool()
+
+        result = tool.run(query="kubernetes")
+        assert "codemate.md" in result
+        assert "RepoRAG 项目上下文" in result

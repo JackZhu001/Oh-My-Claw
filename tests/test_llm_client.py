@@ -1,10 +1,13 @@
-from codemate_agent.llm.client import LLMClient
+import pytest
+
+from codemate_agent.llm.client import LLMClient, ToolProtocolError
 from codemate_agent.schema import Message
 
 
 def _build_client(provider: str) -> LLMClient:
     client = object.__new__(LLMClient)
     client.provider = provider
+    client.temperature = 0.7
     return client
 
 
@@ -70,3 +73,36 @@ def test_parse_minimax_xml_tool_call_from_content():
     assert tool_calls[0].function.name == "run_shell"
     assert tool_calls[0].function.arguments["command"] == "pwd"
     assert "<minimax:tool_call>" not in cleaned
+
+
+def test_parse_minimax_bracket_tool_call_from_content():
+    client = _build_client("minimax")
+    content = """
+[tool_call]
+[invoke name="read_file"]
+[parameter name="file_path"]README.md[/parameter]
+[/invoke]
+[/tool_call]
+保留说明
+"""
+    cleaned, tool_calls = client._parse_minimax_tool_calls_from_content(content)
+    assert tool_calls is not None
+    assert tool_calls[0].function.name == "read_file"
+    assert tool_calls[0].function.arguments["file_path"] == "README.md"
+    assert cleaned == "保留说明"
+
+
+def test_minimax_tool_protocol_mismatch_raises_specific_error():
+    client = _build_client("minimax")
+    client.model = "MiniMax-M2"
+
+    def _boom(params):
+        raise RuntimeError(
+            "Error code: 400 - {'type':'error','error':{'message':'invalid params, tool call result does not follow tool call (2013)'}}"
+        )
+
+    client._call_with_retry = _boom
+    client._convert_messages = lambda messages: [{"role": "user", "content": "hi"}]
+
+    with pytest.raises(ToolProtocolError):
+        client.complete(messages=[Message(role="user", content="hi")], tools=[{"type": "function"}])

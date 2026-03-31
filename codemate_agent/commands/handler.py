@@ -31,8 +31,8 @@ def handle_command(
 ) -> None:
     """处理斜杠命令"""
     # 解析命令：支持 /history <id> 和 /history<id> 两种格式
-    parts = command.lower().split(maxsplit=1)
-    cmd = parts[0]
+    parts = command.split(maxsplit=1)
+    cmd = parts[0].lower()
     args = parts[1] if len(parts) > 1 else ""
 
     # 如果没有参数，尝试解析 /history<id> 格式
@@ -57,6 +57,7 @@ def handle_command(
         "/skills": lambda: _handle_skills(agent),
         "/sessions": lambda: _handle_sessions(session_index),
         "/memory": lambda: _handle_memory(memory_manager),
+        "/rag": lambda: _handle_rag(agent, args),
         "/save": lambda: _handle_save(session_storage, session_index),
     }
 
@@ -136,6 +137,11 @@ def _handle_team(agent: "CodeMateAgent") -> None:
         "[cyan]团队状态:[/cyan]\n"
         f"  team: {status.get('team_name')}\n"
         f"  agent: {status.get('agent_name')} ({status.get('agent_role')})\n"
+        f"  dispatch_enabled: {status.get('dispatch_enabled', False)}\n"
+        f"  strict_mode: {status.get('strict_mode', False)}\n"
+        f"  strict_progress: {status.get('strict_progress', {})}\n"
+        f"  members: {status.get('members', [])}\n"
+        f"  queue: {status.get('queue', {})}\n"
         f"  active_task_id: {status.get('active_task_id')}\n"
         f"  inbox_pending: {status.get('inbox_pending')}\n"
         f"  task_stats: {status.get('task_stats')}\n"
@@ -174,10 +180,23 @@ def _handle_tasks(agent: "CodeMateAgent") -> None:
         return
     console.print("[cyan]任务板:[/cyan]")
     for task in tasks:
-        marker = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}.get(task.get("status"), "[?]")
+        marker = {
+            "pending": "[ ]",
+            "leased": "[L]",
+            "in_progress": "[>]",
+            "blocked": "[!]",
+            "review": "[R]",
+            "completed": "[x]",
+            "failed": "[f]",
+            "cancelled": "[~]",
+        }.get(task.get("status"), "[?]")
+        status_text = str(task.get("status", "unknown"))
         owner = f" @{task.get('owner')}" if task.get("owner") else ""
         worktree = f" ({task.get('worktree')})" if task.get("worktree") else ""
-        console.print(f"  {marker} #{task.get('id')}: {task.get('subject', '')}{owner}{worktree}")
+        console.print(
+            f"  {marker} {status_text:<11} #{task.get('id')}: {task.get('subject', '')}{owner}{worktree}",
+            markup=False,
+        )
     console.print("")
 
 
@@ -294,6 +313,47 @@ def _handle_memory(memory_manager: "MemoryManager | None") -> None:
             title="[bold]记忆内容[/bold]",
             border_style="dim"
         ))
+    console.print()
+
+
+def _handle_rag(agent: "CodeMateAgent", args: str) -> None:
+    """处理 /rag 命令，显示 RepoRAG 命中的项目片段。"""
+    query = (args or "").strip()
+    if not query:
+        console.print("[yellow]用法: /rag <查询内容>[/yellow]\n")
+        return
+
+    inspect = getattr(agent, "inspect_repo_rag", None)
+    if inspect is None:
+        print_error("当前 Agent 不支持 RepoRAG 查看")
+        return
+
+    context = inspect(query)
+    if context is None:
+        print_error("RepoRAG 未启用")
+        return
+    if context.is_empty():
+        console.print("[yellow]RepoRAG 未命中相关片段[/yellow]\n")
+        return
+
+    from rich.panel import Panel
+    from rich.table import Table
+
+    table = Table(show_header=True, header_style="bold magenta")
+    table.add_column("#", justify="right", style="dim")
+    table.add_column("标题", style="cyan")
+    table.add_column("来源", style="white")
+    table.add_column("分数", justify="right", style="green")
+
+    for idx, chunk in enumerate(context.chunks, 1):
+        table.add_row(str(idx), chunk.title, chunk.path or chunk.source, f"{chunk.score:.2f}")
+
+    console.print(f"\n[bold]RepoRAG 命中[/bold] query={query!r}")
+    console.print(table)
+    console.print(
+        f"[dim]sources={context.source_count} chunks={len(context.chunks)} chars={context.total_chars}[/dim]"
+    )
+    console.print(Panel(context.to_prompt_text(), title="[bold]注入预览[/bold]", border_style="dim"))
     console.print()
 
 

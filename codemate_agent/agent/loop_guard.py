@@ -96,6 +96,45 @@ class LoopGuard:
     def _is_error_result(result: str) -> bool:
         if result is None:
             return False
-        text = str(result)
-        error_markers = ("错误", "失败", "❌", "error", "Error", "Exception", "Traceback")
-        return any(marker in text for marker in error_markers)
+        text = str(result).strip()
+        if not text:
+            return False
+
+        lowered = text.lower()
+        prefix_markers = (
+            "错误:",
+            "失败:",
+            "❌",
+            "error:",
+            "exception:",
+            "traceback",
+            "工具执行失败:",
+            "参数验证失败:",
+            "用户取消了操作:",
+        )
+        if any(lowered.startswith(marker.lower()) for marker in prefix_markers):
+            return True
+
+        # task 工具使用结构化文本返回；只有显式 error/failed 才按失败处理。
+        if "--- task result ---" in lowered and (
+            "状态: error" in lowered
+            or "status: error" in lowered
+            or "status: failed" in lowered
+            or '"status": "error"' in lowered
+            or '"status":"error"' in lowered
+            or '"status": "failed"' in lowered
+            or '"status":"failed"' in lowered
+            or "错误 [team_strict_violation]" in lowered
+            or "错误 [team_dispatch_error]" in lowered
+        ):
+            return True
+
+        embedded_markers = (
+            "\ntraceback",
+            "命令不在允许列表",
+            "检测到越界路径访问",
+            "nameerror:",
+            "typeerror:",
+            "valueerror:",
+        )
+        return any(marker.lower() in lowered for marker in embedded_markers)

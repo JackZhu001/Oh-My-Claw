@@ -10,6 +10,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+
 
 # GLM-4 价格（仅供参考，实际价格可能变动）
 # https://open.bigmodel.cn/pricing
@@ -215,31 +219,45 @@ class SessionMetrics:
 
     def print_summary(self) -> None:
         """打印格式化的统计摘要到终端"""
-        print()
-        print("📊 ──────────────────────────────────────────")
-        print(f"   CodeMate Agent 会话统计")
-        print("──────────────────────────────────────────")
-        print(f"  会话 ID     : {self.session_id}")
-        print(f"  模型        : {self.model}")
-        print(f"  持续时间    : {self.duration_seconds:.1f} 秒")
-        print()
-        print(f"  🪙 Token 使用")
-        print(f"     Input   : {self.input_tokens:,}")
-        print(f"     Output  : {self.output_tokens:,}")
-        print(f"     Total   : {self.total_tokens:,}")
-        print()
-        print(f"  💰 预估成本 : ¥{self.estimated_cost:.4f}")
-        print()
-        print(f"  🔄 执行统计")
-        print(f"     总轮数     : {self.total_rounds}")
-        print(f"     LLM 调用   : {self.llm_calls}")
-        print(f"     工具调用   : {self.tool_calls.total_calls}")
+        console = Console()
+
+        overview = Table(show_header=False, box=None, pad_edge=False)
+        overview.add_column("项目", style="cyan", no_wrap=True)
+        overview.add_column("值", style="white")
+        overview.add_row("会话 ID", self.session_id)
+        overview.add_row("模型", self.model)
+        overview.add_row("持续时间", f"{self.duration_seconds:.1f} 秒")
+        overview.add_row("平均 LLM", f"{self.avg_llm_duration_ms:.0f} ms")
+
+        usage = Table(show_header=False, box=None, pad_edge=False)
+        usage.add_column("项目", style="cyan", no_wrap=True)
+        usage.add_column("值", style="white", justify="right")
+        usage.add_row("Input", f"{self.input_tokens:,}")
+        usage.add_row("Output", f"{self.output_tokens:,}")
+        usage.add_row("Total", f"{self.total_tokens:,}")
+        usage.add_row("预估成本", f"¥{self.estimated_cost:.4f}")
+
+        execution = Table(show_header=False, box=None, pad_edge=False)
+        execution.add_column("项目", style="cyan", no_wrap=True)
+        execution.add_column("值", style="white", justify="right")
+        execution.add_row("总轮数", str(self.total_rounds))
+        execution.add_row("LLM 调用", str(self.llm_calls))
+        execution.add_row("工具调用", str(self.tool_calls.total_calls))
+        execution.add_row("错误次数", str(self.errors))
+
+        details = Table(show_header=True, header_style="bold magenta")
+        details.add_column("工具", style="cyan")
+        details.add_column("调用", justify="right", style="white")
+        details.add_column("失败", justify="right", style="red")
+        for tool, count in sorted(self.tool_calls.calls.items()):
+            details.add_row(tool, str(count), str(self.tool_calls.errors.get(tool, 0)))
+
+        console.print()
+        console.print(Panel(overview, title="[bold]Session[/bold]", border_style="bright_magenta"))
+        console.print(Panel(usage, title="[bold]Usage[/bold]", border_style="cyan"))
+        console.print(Panel(execution, title="[bold]Execution[/bold]", border_style="green"))
         if self.tool_calls.calls:
-            print(f"       调用详情 :")
-            for tool, count in sorted(self.tool_calls.calls.items()):
-                print(f"         - {tool}: {count}")
-        print(f"     错误次数   : {self.errors}")
-        print("──────────────────────────────────────────")
+            console.print(Panel(details, title="[bold]Tool Breakdown[/bold]", border_style="yellow"))
 
     def save(self, output_dir: Path) -> Path:
         """

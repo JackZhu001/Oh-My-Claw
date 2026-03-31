@@ -23,6 +23,38 @@ def print_banner() -> None:
     console.print(Panel(BANNER, border_style="magenta", title="[bold pink1]🐾 Welcome[/bold pink1]"))
 
 
+def print_startup_summary(config: object) -> None:
+    """打印启动状态卡片。"""
+    runtime_table = Table(show_header=False, box=None, pad_edge=False)
+    runtime_table.add_column("项目", style="cyan", no_wrap=True)
+    runtime_table.add_column("值", style="white")
+    runtime_table.add_row("模型", str(getattr(config, "model", "")))
+    runtime_table.add_row("轮数上限", str(getattr(config, "max_rounds", "")))
+    runtime_table.add_row("工作目录", str(getattr(config, "cwd", getattr(config, "workspace_dir", "")) or ""))
+
+    features = []
+    if getattr(config, "trace_enabled", False):
+        features.append("Trace")
+    if getattr(config, "metrics_enabled", False):
+        features.append("Metrics")
+    if getattr(config, "persistence_enabled", False):
+        features.append("Memory")
+        features.append("Compact")
+        features.append("Planning")
+    if getattr(config, "repo_rag_enabled", False):
+        features.append("RepoRAG")
+
+    feature_table = Table(show_header=False, box=None, pad_edge=False)
+    feature_table.add_column("状态", style="cyan", no_wrap=True)
+    feature_table.add_column("值", style="white")
+    feature_table.add_row("Provider", str(getattr(config, "api_provider", "")))
+    feature_table.add_row("日志级别", str(getattr(config, "log_level", "")))
+    feature_table.add_row("能力", " · ".join(features) if features else "基础模式")
+
+    console.print(Panel(runtime_table, title="[bold]Runtime[/bold]", border_style="bright_magenta"))
+    console.print(Panel(feature_table, title="[bold]Capabilities[/bold]", border_style="cyan"))
+
+
 def print_help() -> None:
     """打印帮助信息"""
     help_text = """
@@ -42,6 +74,7 @@ def print_help() -> None:
   [cyan]/sessions[/cyan]   - 列出历史会话
   [cyan]/history <id>[/cyan] - 加载指定会话
   [cyan]/memory[/cyan]     - 查看长期记忆
+  [cyan]/rag <query>[/cyan] - 查看 RepoRAG 命中的项目上下文
   [cyan]/save[/cyan]       - 保存当前会话
   [cyan]exit[/cyan]        - 退出程序
 

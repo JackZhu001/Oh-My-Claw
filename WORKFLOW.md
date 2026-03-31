@@ -1,76 +1,105 @@
-# CodeMate Agent 工作流（2026 刷新版）
+# CodeMate Agent 工作流说明（2026-03-31）
 
 ## 1. 主循环（ReAct + Function Calling）
 
 1. 接收用户输入
-2. 判断是否需要任务规划（Planner）
-3. 注入系统提示（基础提示 + 记忆召回 + 技能索引）
-4. 调用 LLM（优先 function calling）
-5. 若有工具调用：执行工具并回填 `tool` 消息
-6. 若无工具调用：输出最终答案
-7. 记录 trace / metrics / heartbeat
-8. LoopGuard 判断连续失败/提前结束
+2. 注入系统上下文（身份约束 + 记忆 + RepoRAG 片段）
+3. 判断是否需要规划（Planner）
+4. 调用 LLM 获取回答或工具调用
+5. 若触发工具：执行 -> 回填 `tool` 消息 -> 继续下一轮
+6. 若无工具：进行完成判定（计划/团队阶段/防提前结束）
+7. 输出结果并落盘会话与观测数据
 
----
+## 2. 复杂任务执行路径
 
-## 2. 复杂任务路径
+复杂任务通常遵循：
 
-复杂任务会触发：
+1. `todo_write` 建立可追踪阶段
+2. 读取代码与文档事实
+3. 实施修改（必要时分块写入）
+4. 运行验证/检查
+5. 复核与总结输出
 
-- 自动计划生成
-- `todo_write` 进度追踪
-- 多轮工具调用（读文档、查目录、写文件）
-- LoopGuard 纠偏（连续失败、提前结束）
+关键保护机制：
 
----
+- 连续失败干预
+- 工具参数校验与修复
+- 重复调用检测与打断
+- 非最终答案识别（避免只输出“思考中”）
 
 ## 3. 上下文工程路径
 
-- **Micro Compact**：每轮对旧工具输出做轻量压缩
-- **Auto Compact**：达到阈值后压缩历史并保留最近关键轮次
-- **Manual Compact**：`/compact` 手动触发
+### 3.1 Micro Compact（每轮）
 
-工具输出同时由 Observation Truncator 进行按工具类型截断。
+- 针对旧 `tool` 输出做轻量收缩
+- 保留最近关键轮次，裁剪低价值历史噪声
 
----
+### 3.2 Auto Compact（阈值触发）
 
-## 4. 子代理路径
+- 上下文接近阈值时自动压缩
+- 压缩前 transcript 落盘，保证可回放
 
-- TaskTool 触发子代理
-- SubagentRunner 在独立会话中运行
-- 限制可用工具，避免副作用
-- 返回结构化摘要给主 Agent
+### 3.3 Manual Compact（手动）
 
----
+- 用户通过 `/compact` 强制压缩
+- 常用于长任务切阶段或进入大文件改造前
 
-## 5. 团队协作路径
+## 4. RepoRAG 路径
 
-- `TeamRuntime` 负责 inbox、任务板、事件日志
-- 自动读取 inbox 注入上下文
-- 可选 task auto-claim
+1. 依据 query 计算检索词
+2. 从记忆、根目录文档、`docs/`、代码文件中召回片段
+3. 预算内拼装上下文注入 system prompt
+4. 再进入主循环决策
 
----
+作用：减少“无关历史”对当前任务的干扰，提高首轮决策命中率。
 
-## 6. 心跳与看门狗
+## 5. Team 模式工作流
 
-- 关键阶段心跳：round / llm / tool
-- 超时看门狗：LLM 或工具执行超时告警
-- `/heartbeat` 可查看状态
+## 5.1 角色
 
----
+- `lead`：调度与收敛
+- `researcher`：事实采集
+- `builder`：实现改动
+- `reviewer`：验收与缺漏检查
 
-## 7. MiniMax 兼容分支
+## 5.2 strict 模式阶段约束
 
-当 provider=minimax：
+默认顺序：
 
-- 历史消息做协议安全规整（system/tool/tool_calls）
-- 兼容解析 `<minimax:tool_call>` 文本协议
-- 若接口报错，逐级降级重试
+1. researcher
+2. builder
+3. reviewer
 
----
+若顺序不满足，coordinator 会拒绝委托并返回约束错误。
 
-## 8. 失败处理策略
+## 5.3 关键状态载体
 
-- 参数验证失败：返回明确错误 + 用法提示
-- 连续失败阈值：注入干预消息，促使更换策略
-- 循环检测：识别重复工具签名并告警/打断
+- `.tasks/`：任务状态与依赖
+- `.team/inbox/`：成员消息
+- `.team/events.jsonl`：结构化运行事件
+- `.team/artifacts/`：成员产物与 manifest
+
+## 6. 心跳与超时看门狗
+
+覆盖阶段：
+
+- round_start
+- llm_request / llm_response
+- tool_call_start / tool_call_end
+
+当单次 LLM 或工具执行超时，会发出 heartbeat alert 并写入事件。
+
+## 7. 失败处理策略
+
+- 参数错误：给出工具正确用法提示
+- 工具不存在：返回可用工具列表
+- 连续失败：注入“更换策略”干预
+- 协议链损坏：重建消息历史并继续
+- LLM 临时故障：重试与降级
+
+## 8. 推荐执行规范
+
+1. 改动任务优先“读事实 -> 写改动 -> 验证”
+2. 大文本写入优先 `write_file_chunks/append_file_chunks`
+3. Team strict 模式下，lead 只调度不直接落地写入
+4. 输出结论前必须有可复核证据（文件、命令、测试）

@@ -76,6 +76,19 @@ logs/traces/*.md
 # Local transcripts / reports
 .transcripts/
 codereview 3/
+cc-review/
+code_review_report.html
+CODE_REVIEW_CC_LOG.md
+.cc_code_review_task.txt
+.run_cc_review.sh
+codemate-website/
+docs-site/
+project-docs-website/
+项目介绍网站（ui设计skill生成）/
+项目介绍网页（UI设计Skill生成）/
+docs/welcome.html
+tmp/
+~/
 
 # Demo outputs
 /demo/

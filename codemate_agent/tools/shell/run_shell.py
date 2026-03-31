@@ -22,10 +22,10 @@ class RunShellTool(Tool):
     """
 
     DEFAULT_ALLOWED_COMMANDS = frozenset({
-        "awk", "bash", "cat", "cp", "curl", "cut", "date", "echo", "env", "find",
+        "awk", "cat", "cp", "curl", "cut", "date", "echo", "env", "find",
         "git", "go", "grep", "head", "ls", "make", "mkdir", "mv", "node", "npm",
         "pip", "pip3", "printf", "pwd", "py", "python", "python3", "pytest", "rg",
-        "rm", "sed", "sort", "tail", "touch", "tr", "uname", "uniq", "wc", "which",
+        "rm", "sed", "sh", "sort", "tail", "touch", "tr", "uname", "uniq", "wc", "which",
         "xargs",
     })
 
@@ -241,6 +241,19 @@ class RunShellTool(Tool):
                     return True
         return False
 
+    @staticmethod
+    def _is_inline_wrapper(tokens: List[str]) -> bool:
+        if not tokens:
+            return False
+        exe = (tokens[0] or "").strip().lower()
+        if exe in {"bash", "sh"}:
+            return any(flag in {"-c", "-lc"} for flag in tokens[1:])
+        if exe in {"python", "python3", "py"}:
+            return any(flag in {"-c", "--command"} for flag in tokens[1:])
+        if exe == "node":
+            return any(flag in {"-e", "--eval", "-p", "--print"} for flag in tokens[1:])
+        return False
+
     def run(self, command: str, timeout: int = 30, **kwargs) -> str:
         """
         执行 shell 命令
@@ -272,6 +285,12 @@ class RunShellTool(Tool):
 
         if not segments:
             return "错误: 未检测到可执行命令"
+
+        if any(self._is_inline_wrapper(tokens) for tokens in segments):
+            return (
+                "错误: 检测到 inline wrapper 执行（bash/sh -c、python -c、node -e/-p），已拒绝。"
+                "请直接执行目标命令。"
+            )
 
         disallowed = [tokens[0] for tokens in segments if not self._is_allowed_executable(tokens[0])]
         if disallowed:

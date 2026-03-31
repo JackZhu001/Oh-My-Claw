@@ -159,7 +159,16 @@ class TaskUpdateTool(_TaskBoardToolBase, Tool):
                 "task_id": {"type": "integer", "description": "任务 ID"},
                 "status": {
                     "type": "string",
-                    "enum": ["pending", "in_progress", "completed", "cancelled"],
+                    "enum": [
+                        "pending",
+                        "leased",
+                        "in_progress",
+                        "blocked",
+                        "review",
+                        "completed",
+                        "failed",
+                        "cancelled",
+                    ],
                     "description": "任务状态",
                 },
                 "owner": {"type": "string", "description": "负责人"},
@@ -234,8 +243,12 @@ class TaskListTool(_TaskBoardToolBase, Tool):
         for task in tasks:
             marker = {
                 "pending": "[ ]",
+                "leased": "[L]",
                 "in_progress": "[>]",
+                "blocked": "[!]",
+                "review": "[R]",
                 "completed": "[x]",
+                "failed": "[f]",
                 "cancelled": "[~]",
             }.get(task.get("status"), "[?]")
             owner = f" @{task.get('owner')}" if task.get("owner") else ""

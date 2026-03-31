@@ -39,16 +39,6 @@ class _BackgroundTaskManager:
         if not clean:
             return ""
         try:
-            outer_parts = shlex.split(clean)
-        except ValueError:
-            outer_parts = []
-        if (
-            len(outer_parts) >= 3
-            and outer_parts[0] in {"bash", "sh"}
-            and outer_parts[1] in {"-lc", "-c"}
-        ):
-            clean = outer_parts[2]
-        try:
             return " ".join(shlex.split(clean))
         except ValueError:
             return " ".join(clean.split())

@@ -317,7 +317,7 @@ class ArgumentValidator:
             "run_shell": "run_shell(command='ls -la')",
             "search_code": "search_code(pattern='def function_name')",
             "search_files": "search_files(pattern='*.py')",
-            "task": "task(description='任务描述', prompt='详细指令', subagent_type='explore')",
+            "task": "task(agent_id='researcher', description='任务描述', prompt='详细指令')",
             "task_create": "task_create(subject='实现登录', description='补充登录流程')",
             "task_get": "task_get(task_id=1)",
             "task_update": "task_update(task_id=1, status='in_progress', add_blocks=[2])",

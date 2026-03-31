@@ -54,7 +54,8 @@ def setup_logger(
         return _loggers[name]
 
     logger = logging.getLogger(name)
-    logger.setLevel(getattr(logging, level.upper(), logging.INFO))
+    resolved_level = getattr(logging, level.upper(), logging.INFO)
+    logger.setLevel(resolved_level)
 
     # 避免重复添加 handler
     if not logger.handlers:
@@ -62,7 +63,7 @@ def setup_logger(
             handler = RichHandler(
                 rich_tracebacks=True,
                 show_time=True,
-                show_path=True,
+                show_path=resolved_level <= logging.DEBUG,
                 markup=True,  # 支持 [red]红色[/red] 这种标记
             )
             # RichHandler 自动显示 logger 名称和级别

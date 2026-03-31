@@ -38,6 +38,11 @@ class Config:
     # 子代理配置
     subagent_max_steps: int = field(default_factory=lambda: int(os.getenv("SUBAGENT_MAX_STEPS", "15")))
 
+    # RepoRAG 配置
+    repo_rag_enabled: bool = field(default_factory=lambda: os.getenv("REPO_RAG_ENABLED", "true").lower() == "true")
+    repo_rag_top_k: int = field(default_factory=lambda: int(os.getenv("REPO_RAG_TOP_K", "5")))
+    repo_rag_char_budget: int = field(default_factory=lambda: int(os.getenv("REPO_RAG_CHAR_BUDGET", "2500")))
+
     # 日志配置
     log_level: str = field(default_factory=lambda: os.getenv("LOG_LEVEL", "INFO"))
 
@@ -84,6 +89,10 @@ class Config:
             return False, "MAX_ROUNDS 必须大于 0"
         if not 0 <= self.temperature <= 2:
             return False, "TEMPERATURE 必须在 0-2 之间"
+        if self.repo_rag_top_k <= 0:
+            return False, "REPO_RAG_TOP_K 必须大于 0"
+        if self.repo_rag_char_budget < 500:
+            return False, "REPO_RAG_CHAR_BUDGET 必须至少为 500"
         return True, None
 
     def get_light_config(self) -> dict:

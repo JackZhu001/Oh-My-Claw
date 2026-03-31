@@ -19,12 +19,32 @@ VALID_MESSAGE_TYPES = frozenset(
         "shutdown_response",
         "plan_approval_request",
         "plan_approval_response",
+        "delegate_request",
+        "delegate_accept",
+        "delegate_reject",
+        "artifact_submit",
+        "review_request",
+        "review_response",
+        "handoff_request",
+        "cancel_request",
+        "status_report",
     }
 )
 
-_VALID_PROTOCOLS = frozenset({"shutdown", "plan_approval"})
+_VALID_PROTOCOLS = frozenset(
+    {
+        "shutdown",
+        "plan_approval",
+        "delegate",
+        "artifact",
+        "review",
+        "handoff",
+        "cancel",
+        "status",
+    }
+)
 _VALID_REQUEST_STATUSES = frozenset(
-    {"pending", "approved", "rejected", "cancelled", "completed"}
+    {"pending", "approved", "rejected", "cancelled", "completed", "failed"}
 )
 
 
@@ -83,6 +103,10 @@ class RequestRecord:
     status: str = "pending"
     reason: str = ""
     responder: str = ""
+    task_id: Optional[int] = None
+    session_id: str = ""
+    parent_request_id: str = ""
+    correlation_id: str = ""
     payload: dict[str, Any] = field(default_factory=dict)
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
@@ -96,6 +120,10 @@ class RequestRecord:
             "status": self.status,
             "reason": self.reason,
             "responder": self.responder,
+            "task_id": self.task_id,
+            "session_id": self.session_id,
+            "parent_request_id": self.parent_request_id,
+            "correlation_id": self.correlation_id,
             "payload": self.payload,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
@@ -130,6 +158,10 @@ class RequestTracker:
         target: str = "",
         payload: Optional[dict[str, Any]] = None,
         request_id: Optional[str] = None,
+        task_id: Optional[int] = None,
+        session_id: str = "",
+        parent_request_id: str = "",
+        correlation_id: str = "",
     ) -> RequestRecord:
         protocol_name = self._validate_protocol(protocol)
         rid = request_id or uuid.uuid4().hex[:8]
@@ -140,6 +172,10 @@ class RequestTracker:
             sender=sender,
             target=target,
             status="pending",
+            task_id=task_id,
+            session_id=session_id,
+            parent_request_id=parent_request_id,
+            correlation_id=correlation_id,
             payload=dict(payload or {}),
             created_at=now,
             updated_at=now,
@@ -160,6 +196,10 @@ class RequestTracker:
         create_if_missing: bool = False,
         sender: str = "",
         target: str = "",
+        task_id: Optional[int] = None,
+        session_id: str = "",
+        parent_request_id: str = "",
+        correlation_id: str = "",
     ) -> Optional[RequestRecord]:
         protocol_name = self._validate_protocol(protocol)
         status_name = self._validate_status(status)
@@ -173,6 +213,10 @@ class RequestTracker:
                     sender=sender,
                     target=target,
                     status="pending",
+                    task_id=task_id,
+                    session_id=session_id,
+                    parent_request_id=parent_request_id,
+                    correlation_id=correlation_id,
                     created_at=now,
                     updated_at=now,
                 )
@@ -189,6 +233,14 @@ class RequestTracker:
                 merged = dict(record.payload)
                 merged.update(payload)
                 record.payload = merged
+            if task_id is not None:
+                record.task_id = task_id
+            if session_id:
+                record.session_id = session_id
+            if parent_request_id:
+                record.parent_request_id = parent_request_id
+            if correlation_id:
+                record.correlation_id = correlation_id
             return record
 
     def ingest_message(self, payload: dict[str, Any]) -> Optional[RequestRecord]:
@@ -244,6 +296,123 @@ class RequestTracker:
                 create_if_missing=True,
             )
 
+        if msg.msg_type == "delegate_request":
+            return self.create_request(
+                "delegate",
+                sender=msg.sender,
+                target=str(msg.extra.get("to", "")),
+                payload=msg.extra,
+                request_id=request_id,
+                task_id=msg.extra.get("task_id"),
+                session_id=str(msg.extra.get("session_id", "")),
+                parent_request_id=str(msg.extra.get("parent_request_id", "")),
+                correlation_id=str(msg.extra.get("correlation_id", "")),
+            )
+
+        if msg.msg_type in {"delegate_accept", "delegate_reject"}:
+            status = "approved" if msg.msg_type == "delegate_accept" else "rejected"
+            return self.update_request(
+                "delegate",
+                request_id=request_id,
+                status=status,
+                responder=msg.sender,
+                reason=msg.content,
+                payload=msg.extra,
+                create_if_missing=True,
+                task_id=msg.extra.get("task_id"),
+                session_id=str(msg.extra.get("session_id", "")),
+                parent_request_id=str(msg.extra.get("parent_request_id", "")),
+                correlation_id=str(msg.extra.get("correlation_id", "")),
+            )
+
+        if msg.msg_type == "artifact_submit":
+            return self.update_request(
+                "artifact",
+                request_id=request_id,
+                status="completed",
+                responder=msg.sender,
+                reason=msg.content,
+                payload=msg.extra,
+                create_if_missing=True,
+                task_id=msg.extra.get("task_id"),
+                session_id=str(msg.extra.get("session_id", "")),
+                parent_request_id=str(msg.extra.get("parent_request_id", "")),
+                correlation_id=str(msg.extra.get("correlation_id", "")),
+            )
+
+        if msg.msg_type == "review_request":
+            return self.create_request(
+                "review",
+                sender=msg.sender,
+                target=str(msg.extra.get("to", "")),
+                payload=msg.extra,
+                request_id=request_id,
+                task_id=msg.extra.get("task_id"),
+                session_id=str(msg.extra.get("session_id", "")),
+                parent_request_id=str(msg.extra.get("parent_request_id", "")),
+                correlation_id=str(msg.extra.get("correlation_id", "")),
+            )
+
+        if msg.msg_type == "review_response":
+            review_status = msg.extra.get("status", "completed")
+            status = "approved" if str(review_status).lower() in {"approved", "pass", "completed"} else "rejected"
+            return self.update_request(
+                "review",
+                request_id=request_id,
+                status=status,
+                responder=msg.sender,
+                reason=msg.content or str(msg.extra.get("feedback", "")),
+                payload=msg.extra,
+                create_if_missing=True,
+                task_id=msg.extra.get("task_id"),
+                session_id=str(msg.extra.get("session_id", "")),
+                parent_request_id=str(msg.extra.get("parent_request_id", "")),
+                correlation_id=str(msg.extra.get("correlation_id", "")),
+            )
+
+        if msg.msg_type == "handoff_request":
+            return self.create_request(
+                "handoff",
+                sender=msg.sender,
+                target=str(msg.extra.get("to", "")),
+                payload=msg.extra,
+                request_id=request_id,
+                task_id=msg.extra.get("task_id"),
+                session_id=str(msg.extra.get("session_id", "")),
+                parent_request_id=str(msg.extra.get("parent_request_id", "")),
+                correlation_id=str(msg.extra.get("correlation_id", "")),
+            )
+
+        if msg.msg_type == "cancel_request":
+            return self.update_request(
+                "cancel",
+                request_id=request_id,
+                status="cancelled",
+                responder=msg.sender,
+                reason=msg.content or str(msg.extra.get("reason", "")),
+                payload=msg.extra,
+                create_if_missing=True,
+                task_id=msg.extra.get("task_id"),
+                session_id=str(msg.extra.get("session_id", "")),
+                parent_request_id=str(msg.extra.get("parent_request_id", "")),
+                correlation_id=str(msg.extra.get("correlation_id", "")),
+            )
+
+        if msg.msg_type == "status_report":
+            return self.update_request(
+                "status",
+                request_id=request_id,
+                status="pending",
+                responder=msg.sender,
+                reason=msg.content,
+                payload=msg.extra,
+                create_if_missing=True,
+                task_id=msg.extra.get("task_id"),
+                session_id=str(msg.extra.get("session_id", "")),
+                parent_request_id=str(msg.extra.get("parent_request_id", "")),
+                correlation_id=str(msg.extra.get("correlation_id", "")),
+            )
+
         return None
 
     def get_request(self, protocol: str, request_id: str) -> Optional[dict[str, Any]]:
@@ -276,6 +445,9 @@ class RequestTracker:
                     "pending": sum(1 for r in values if r.status == "pending"),
                     "approved": sum(1 for r in values if r.status == "approved"),
                     "rejected": sum(1 for r in values if r.status == "rejected"),
+                    "completed": sum(1 for r in values if r.status == "completed"),
+                    "cancelled": sum(1 for r in values if r.status == "cancelled"),
+                    "failed": sum(1 for r in values if r.status == "failed"),
                 }
                 pending[protocol] = [r.to_dict() for r in values if r.status == "pending"]
             return {"counts": counts, "pending": pending}

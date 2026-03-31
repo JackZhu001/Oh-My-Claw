@@ -6,7 +6,6 @@ Team Runtime
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any, Optional, Callable
 
@@ -17,6 +16,8 @@ from codemate_agent.team import (
     StructuredEventLogger,
     TaskBoard,
 )
+from codemate_agent.team.coordinator import TeamCoordinator
+from codemate_agent.team.definitions import ExecutionResult
 from codemate_agent.tools.shell.background_tasks import drain_background_notifications
 
 
@@ -35,6 +36,7 @@ class TeamRuntime:
         round_provider: Callable[[], int],
         progress_callback: Optional[Callable[[str, dict], None]] = None,
         logger=None,
+        team_coordinator: Optional[TeamCoordinator] = None,
         task_auto_claim_enabled: bool = False,
         background_tasks_enabled: bool = True,
         identity_reinject_threshold: int = 6,
@@ -50,6 +52,7 @@ class TeamRuntime:
         self.round_provider = round_provider
         self.progress_callback = progress_callback
         self.logger = logger
+        self.team_coordinator = team_coordinator
         self.task_auto_claim_enabled = task_auto_claim_enabled
         self.background_tasks_enabled = background_tasks_enabled
         self.identity_reinject_threshold = identity_reinject_threshold
@@ -70,6 +73,8 @@ class TeamRuntime:
             self.request_tracker = RequestTracker()
             self.task_board = TaskBoard(self.workspace_dir / ".tasks")
             self.team_event_logger = StructuredEventLogger(team_dir / "events.jsonl")
+            if self.team_coordinator is not None and self.team_coordinator.request_tracker is None:
+                self.team_coordinator.request_tracker = self.request_tracker
 
     @property
     def active_task_id(self) -> Optional[int]:
@@ -117,10 +122,8 @@ class TeamRuntime:
         for payload in inbox:
             if self.request_tracker:
                 self.request_tracker.ingest_message(payload)
-            raw = json.dumps(payload, ensure_ascii=False)
-            self.messages.append(
-                Message(role="system", content=f"<team_message>{raw}</team_message>")
-            )
+            summary = self._summarize_team_payload(payload)
+            self.messages.append(Message(role="system", content=f"<team_update>{summary}</team_update>"))
         self._emit_progress("team_inbox", {"count": len(inbox)})
         self.emit_event("inbox_ingested", {"count": len(inbox)})
 
@@ -135,10 +138,8 @@ class TeamRuntime:
             return
         if not notifications:
             return
-        payload = json.dumps(notifications, ensure_ascii=False)
-        self.messages.append(
-            Message(role="system", content=f"<background_results>{payload}</background_results>")
-        )
+        summary = self._summarize_background_notifications(notifications)
+        self.messages.append(Message(role="system", content=f"<background_results>{summary}</background_results>"))
         self._emit_progress("background_results", {"count": len(notifications)})
         self.emit_event("background_results", {"count": len(notifications)})
 
@@ -250,6 +251,17 @@ class TeamRuntime:
         tracker_snapshot = self.request_tracker.snapshot() if self.request_tracker else {"counts": {}, "pending": {}}
         tasks_stats = self.task_board.get_stats() if self.task_board else {}
         inbox_size = self.message_bus.inbox_size(self.agent_name) if self.message_bus else 0
+        members = []
+        if self.team_coordinator and self.team_coordinator.team_definition:
+            members = sorted(self.team_coordinator.team_definition.members.keys())
+        queue_stats = (
+            self.team_coordinator.get_queue_stats() if self.team_coordinator is not None else {}
+        )
+        strict_progress = (
+            self.team_coordinator.get_strict_progress(self.session_id_provider())
+            if self.team_coordinator is not None
+            else {}
+        )
         return {
             "enabled": True,
             "team_name": self.team_name,
@@ -259,7 +271,50 @@ class TeamRuntime:
             "inbox_pending": inbox_size,
             "task_stats": tasks_stats,
             "request_tracker": tracker_snapshot,
+            "dispatch_enabled": self.team_coordinator is not None,
+            "members": members,
+            "queue": queue_stats,
+            "strict_mode": bool(strict_progress.get("strict_mode", False)),
+            "strict_progress": strict_progress,
         }
+
+    def dispatch_task(
+        self,
+        *,
+        agent_id: str,
+        title: str,
+        instructions: str,
+        context_summary: str = "",
+        cwd: str = "",
+        parent_task_id: Optional[int] = None,
+    ) -> ExecutionResult:
+        if not self.enabled or self.team_coordinator is None:
+            raise RuntimeError("team dispatch is not enabled")
+
+        self.emit_event(
+            "task_dispatch_requested",
+            {"to": agent_id, "title": title, "delegated_by": self.agent_name},
+        )
+        result = self.team_coordinator.dispatch_to(
+            agent_id=agent_id,
+            title=title,
+            instructions=instructions,
+            context_summary=context_summary,
+            delegated_by=self.agent_name,
+            parent_task_id=parent_task_id,
+            cwd=cwd or str(self.workspace_dir),
+            parent_session_id=self.session_id_provider(),
+        )
+        self.emit_event(
+            "task_dispatch_finished",
+            {
+                "to": agent_id,
+                "task_id": result.task_id,
+                "status": result.status,
+                "session_id": result.session_id,
+            },
+        )
+        return result
 
     def peek_inbox(self, limit: int = 20) -> list[dict[str, Any]]:
         if not self.enabled or not self.message_bus:
@@ -287,3 +342,31 @@ class TeamRuntime:
         except Exception as e:
             if self.logger:
                 self.logger.debug(f"团队进度回调异常: {e}")
+
+    def _summarize_team_payload(self, payload: dict[str, Any]) -> str:
+        msg_type = str(payload.get("type", "message"))
+        sender = str(payload.get("from", "?"))
+        target = str(payload.get("to", self.agent_name))
+        content = " ".join(str(payload.get("content", "")).split())
+        if len(content) > 120:
+            content = content[:117] + "..."
+        task_id = payload.get("task_id")
+        request_id = payload.get("request_id", "")
+        task_part = f" task#{task_id}" if task_id is not None else ""
+        req_part = f" req={request_id}" if request_id else ""
+        return f"[{msg_type}] {sender}->{target}{task_part}{req_part}: {content}"
+
+    def _summarize_background_notifications(self, notifications: list[dict[str, Any]]) -> str:
+        parts: list[str] = []
+        for item in notifications[:5]:
+            task_id = item.get("task_id", "?")
+            status = item.get("status", "unknown")
+            cmd = " ".join(str(item.get("command", "")).split())
+            if len(cmd) > 60:
+                cmd = cmd[:57] + "..."
+            parts.append(f"{task_id}:{status}:{cmd}")
+        if not parts:
+            return "no notifications"
+        if len(notifications) > 5:
+            parts.append(f"+{len(notifications) - 5} more")
+        return " | ".join(parts)

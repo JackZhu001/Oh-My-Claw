@@ -5,10 +5,11 @@
 """
 
 import logging
-import math
 import re
 from pathlib import Path
 from typing import Optional
+
+from codemate_agent.retrieval.bm25 import bm25_rank, tokenize_text
 
 logger = logging.getLogger(__name__)
 
@@ -277,11 +278,11 @@ src/
         if not documents:
             return "# 长期记忆\n\n暂无可检索内容。"
 
-        query_tokens = self._tokenize(query)
+        query_tokens = tokenize_text(query)
         if not query_tokens:
             return self.load_all_memory()
 
-        scored = self._bm25_rank(documents, query_tokens)
+        scored = bm25_rank(documents, query_tokens)
         top_docs = [doc for doc, score in scored[:top_k] if score > 0]
         if not top_docs:
             return self.load_all_memory()
@@ -370,7 +371,8 @@ src/
                     "source": filename,
                     "title": filename,
                     "content": content,
-                    "tokens": self._tokenize(content),
+                    "tokens": tokenize_text(content),
+                    "path": "",
                 })
                 continue
             for sec in sections:
@@ -385,42 +387,14 @@ src/
                     "source": filename,
                     "title": title,
                     "content": text,
-                    "tokens": self._tokenize(text),
+                    "tokens": tokenize_text(text),
+                    "path": "",
                 })
         return docs
 
-    def _tokenize(self, text: str) -> list[str]:
-        return re.findall(r"[a-zA-Z0-9_]+|[\u4e00-\u9fff]+", text.lower())
-
-    def _bm25_rank(self, docs: list[dict], query_tokens: list[str]) -> list[tuple[dict, float]]:
-        k1 = 1.5
-        b = 0.75
-        n_docs = len(docs)
-        avg_len = sum(len(d["tokens"]) for d in docs) / max(n_docs, 1)
-
-        df = {}
-        for d in docs:
-            for t in set(d["tokens"]):
-                df[t] = df.get(t, 0) + 1
-
-        scored = []
-        for d in docs:
-            tf = {}
-            for t in d["tokens"]:
-                tf[t] = tf.get(t, 0) + 1
-            dl = len(d["tokens"]) or 1
-            score = 0.0
-            for q in query_tokens:
-                if q not in tf:
-                    continue
-                n_q = df.get(q, 0)
-                idf = math.log(1 + (n_docs - n_q + 0.5) / (n_q + 0.5))
-                freq = tf[q]
-                denom = freq + k1 * (1 - b + b * dl / max(avg_len, 1))
-                score += idf * (freq * (k1 + 1)) / denom
-            scored.append((d, score))
-        scored.sort(key=lambda x: x[1], reverse=True)
-        return scored
+    def get_memory_documents(self) -> list[dict]:
+        """公开长期记忆片段，供 RepoRAG 统一检索。"""
+        return self._build_memory_documents()
 
     def get_memory_files_info(self) -> dict[str, dict]:
         """

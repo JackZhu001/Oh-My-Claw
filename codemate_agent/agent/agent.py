@@ -15,14 +15,15 @@ Agent 实现
 - Function Calling: LLM 直接返回结构化的 tool_calls，更可靠
 """
 
-import json
 import os
-import uuid
+import json
 import time
-from typing import Any, List, Optional, Callable
+import uuid
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any, List, Optional
 
-from codemate_agent.llm.client import LLMClient as GLMClient
+from codemate_agent.llm.client import LLMClient as GLMClient, ToolProtocolError
 from codemate_agent.schema import Message, LLMResponse, ToolCall, FunctionCall
 from codemate_agent.tools.base import Tool
 from codemate_agent.tools.registry import ToolRegistry
@@ -30,6 +31,7 @@ from codemate_agent.logging import setup_logger, TraceLogger, SessionMetrics, Tr
 from codemate_agent.persistence import SessionStorage, MemoryManager
 from codemate_agent.context import ContextCompressor, CompressionConfig, ObservationTruncator
 from codemate_agent.planner import TaskPlanner
+from codemate_agent.retrieval import RepoRAG
 from codemate_agent.subagent import TaskTool
 from codemate_agent.validation import ArgumentValidator
 from codemate_agent.skill import SkillManager
@@ -38,6 +40,7 @@ from codemate_agent.agent.loop_detector import LoopDetector
 from codemate_agent.agent.heartbeat import HeartbeatMonitor
 from codemate_agent.agent.loop_guard import LoopGuard
 from codemate_agent.agent.team_runtime import TeamRuntime
+from codemate_agent.team.coordinator import TeamCoordinator
 
 
 # 需要用户确认的危险工具
@@ -48,6 +51,8 @@ DANGEROUS_TOOLS = {
     "background_run",
     "task_cleanup",
 }
+
+MAX_INLINE_FILE_CONTENT = 3000
 
 
 class CodeMateAgent:
@@ -80,6 +85,9 @@ class CodeMateAgent:
         plan_display_callback: Optional[Callable[[str], None]] = None,
         progress_callback: Optional[Callable[[str, dict], None]] = None,
         light_llm_client: Optional["GLMClient"] = None,
+        repo_rag_enabled: bool = True,
+        repo_rag_top_k: int = 5,
+        repo_rag_char_budget: int = 2500,
     ):
         """
         初始化 Agent
@@ -100,6 +108,9 @@ class CodeMateAgent:
             plan_display_callback: 计划显示回调函数，用于显示执行计划（可选）
             progress_callback: 进度回调函数，接收 (event, data)，用于实时显示进度（可选）
             light_llm_client: 轻量模型客户端，用于子代理的简单任务（可选，默认使用主模型）
+            repo_rag_enabled: 是否启用 RepoRAG 项目知识检索
+            repo_rag_top_k: RepoRAG 默认返回片段数
+            repo_rag_char_budget: RepoRAG 注入上下文的总字符预算
         """
         self.llm = llm_client                    # LLM 客户端
         self.light_llm = light_llm_client        # 轻量模型客户端
@@ -117,6 +128,15 @@ class CodeMateAgent:
         # 持久化系统
         self.session_storage = session_storage
         self.memory_manager = memory_manager
+        self.repo_rag_enabled = repo_rag_enabled
+        self.repo_rag = None
+        if self.repo_rag_enabled:
+            self.repo_rag = RepoRAG(
+                workspace_dir=self.workspace_dir,
+                memory_manager=self.memory_manager,
+                top_k=repo_rag_top_k,
+                char_budget=repo_rag_char_budget,
+            )
 
         # 上下文压缩
         self.compression_enabled = compression_enabled
@@ -180,11 +200,19 @@ class CodeMateAgent:
 
         # Task 工具：用于委托子代理
         # 需要注入依赖（llm_client, tool_registry, 以及可选的 light_llm_client）
+        self.team_coordinator = TeamCoordinator(
+            workspace_dir=self.workspace_dir,
+            main_llm_client=llm_client,
+            light_llm_client=light_llm_client,
+            tool_registry=self.tool_registry,
+        )
         self.task_tool = TaskTool(working_dir=str(self.workspace_dir))
         self.task_tool.set_dependencies(
             main_llm_client=llm_client,
             tool_registry=self.tool_registry,
             light_llm_client=light_llm_client,
+            team_coordinator=self.team_coordinator,
+            delegate_handler=None,
         )
         # 注册 Task 工具
         self.tool_registry.register(self.task_tool)
@@ -216,7 +244,10 @@ class CodeMateAgent:
             self.tool_registry.register(MemoryWriteTool())
 
             from codemate_agent.tools.memory.memory_read import MemoryReadTool
-            MemoryReadTool.set_dependencies(memory_manager=self.memory_manager)
+            MemoryReadTool.set_dependencies(
+                memory_manager=self.memory_manager,
+                repo_rag=self.repo_rag,
+            )
             self.tool_registry.register(MemoryReadTool())
 
         # 统计信息
@@ -284,11 +315,13 @@ class CodeMateAgent:
             round_provider=lambda: self.round_count,
             progress_callback=self.progress_callback,
             logger=self.logger,
+            team_coordinator=self.team_coordinator,
             task_auto_claim_enabled=self.task_auto_claim_enabled,
             background_tasks_enabled=self.background_tasks_enabled,
             identity_reinject_threshold=self._identity_reinject_threshold,
         ) if self.team_enabled else None
         if self.team:
+            self.task_tool.set_delegate_handler(self.team.dispatch_task)
             self.team.ensure_identity_block(force=True)
             self.team.sync_shell_context()
             self.team.emit_event(
@@ -354,7 +387,7 @@ class CodeMateAgent:
         # 系统提示词中只包含 Skill 索引（name + description）
 
         # 记录用户输入
-        self.logger.info(f"用户输入: {query[:100]}...")
+        self.logger.debug(f"用户输入: {query[:100]}...")
         self.heartbeat.emit("run_started", source="run", query_len=len(query))
         self._emit_team_event("run_started", {"query_len": len(query)})
         if self.trace_logger:
@@ -460,6 +493,10 @@ class CodeMateAgent:
         tools = [t.to_openai_schema() for t in self.tool_registry.get_all().values()]
 
         # 步骤 2-4: 主循环
+        tool_protocol_repairs = 0
+        llm_transient_failures = 0
+        llm_transient_retry_rounds = int(os.getenv("LLM_TRANSIENT_RETRY_ROUNDS", "3"))
+        llm_transient_soft_fail = os.getenv("LLM_TRANSIENT_SOFT_FAIL", "true").lower() == "true"
         while self.round_count < self.max_rounds:
             self.round_count += 1
             if self.metrics:
@@ -547,12 +584,85 @@ class CodeMateAgent:
                     step=self.round_count,
                 )
 
-            response: LLMResponse = self.llm.complete(
-                messages=self.messages,
-                tools=tools,
-            )
+            try:
+                response: LLMResponse = self.llm.complete(
+                    messages=self.messages,
+                    tools=tools,
+                )
+            except ToolProtocolError as e:
+                if tool_protocol_repairs >= 1:
+                    raise
+                tool_protocol_repairs += 1
+                self.logger.warning("检测到工具协议链损坏，正在重建兼容历史后重试: %s", e)
+                self._repair_tool_protocol_history(str(e))
+                continue
+            except Exception as e:
+                if not self._is_transient_llm_error(str(e)):
+                    raise
+                llm_transient_failures += 1
+                self.logger.warning(
+                    "LLM 暂时不可用（第 %s/%s 次）: %s",
+                    llm_transient_failures,
+                    llm_transient_retry_rounds,
+                    e,
+                )
+                self.heartbeat.emit(
+                    "llm_error",
+                    source="llm",
+                    transient=True,
+                    retry=llm_transient_failures,
+                )
+                self._emit_team_event(
+                    "llm_error",
+                    {
+                        "transient": True,
+                        "retry": llm_transient_failures,
+                        "error": str(e)[:300],
+                    },
+                )
+                if llm_transient_failures > llm_transient_retry_rounds:
+                    fallback = (
+                        "上游模型服务持续异常（多次 5xx/网络波动），本次任务已中止以避免无效重试。"
+                        "请稍后重试，或切换到更稳定的 provider/model 后再执行。"
+                    )
+                    self.heartbeat.emit(
+                        "llm_unavailable",
+                        source="llm",
+                        transient=True,
+                        retries=llm_transient_failures,
+                    )
+                    self._emit_team_event(
+                        "llm_unavailable",
+                        {"retries": llm_transient_failures, "error": str(e)[:300]},
+                    )
+                    self.logger.error(
+                        "上游模型服务持续异常，终止本次运行（soft_fail=%s）: %s",
+                        llm_transient_soft_fail,
+                        e,
+                    )
+                    if llm_transient_soft_fail:
+                        if self.session_storage:
+                            try:
+                                self.session_storage.add_assistant_message(fallback)
+                                self.session_storage.update_metadata(total_tokens=self.total_tokens)
+                            except Exception:
+                                pass
+                        return fallback
+                    raise
+                self.messages.append(
+                    Message(
+                        role="system",
+                        content=(
+                            "上游模型服务暂时异常（HTTP 5xx/网络波动）。"
+                            f"已自动重试 {llm_transient_failures}/{llm_transient_retry_rounds}，"
+                            "请继续执行当前任务，不要改变任务目标。"
+                        ),
+                    )
+                )
+                continue
 
             duration_ms = (time.time() - start_time) * 1000
+            llm_transient_failures = 0
             self.heartbeat.emit("llm_response", source="llm", duration_ms=round(duration_ms, 2))
             self.heartbeat.check_timeout("llm", duration_ms)
             self._emit_team_event(
@@ -764,7 +874,7 @@ class CodeMateAgent:
                         # 检查 todo 完成状态
                         if self._check_todo_completion(result):
                             self._todo_all_completed = True
-                            self.logger.info("检测到所有 todo 任务已完成")
+                            self.logger.debug("检测到所有 todo 任务已完成")
                     # 触发工具调用完成事件
                     self._emit_progress("tool_call_end", {
                         "tool": tool_name,
@@ -812,8 +922,14 @@ class CodeMateAgent:
                     ))
                     continue
 
+                team_intervention = self._build_team_completion_intervention()
+                if team_intervention:
+                    self.logger.warning("TEAM_STRICT_MODE 阶段未完成，注入继续执行提示")
+                    self.messages.append(Message(role="system", content=team_intervention))
+                    continue
+
                 # 没有工具调用，说明 LLM 已经给出最终答案
-                self.logger.info(f"任务完成，共 {self.round_count} 轮")
+                self.logger.debug(f"任务完成，共 {self.round_count} 轮")
                 self.heartbeat.emit("completed", source="run", total_rounds=self.round_count)
                 self._emit_team_event("run_completed", {"total_rounds": self.round_count})
                 if self.team:
@@ -827,7 +943,7 @@ class CodeMateAgent:
                     # 自动生成会话摘要
                     try:
                         self.session_storage.generate_summary(self.llm, response.content or "")
-                        self.logger.info("会话摘要已生成")
+                        self.logger.debug("会话摘要已生成")
                     except Exception as e:
                         self.logger.warning(f"摘要生成失败: {e}")
 
@@ -881,6 +997,42 @@ class CodeMateAgent:
         if any(marker in text for marker in final_markers):
             return False
 
+        tool_protocol_markers = (
+            "[append_file output]",
+            "[write_file output]",
+            "[write_file_chunks output]",
+            "[append_file_chunks output]",
+            "[tool ",
+            "</tool_call>",
+            "<tool_call",
+            "<minimax:tool_call",
+            "[tool_call]",
+            "[/tool_call]",
+            "<invoke",
+            "[invoke",
+        )
+        lowered = text.lower()
+        if any(marker.lower() in lowered for marker in tool_protocol_markers):
+            return True
+
+        # 未完成计划时，短句式的“自我指令/下一步动作”通常不是最终交付。
+        normalized = " ".join(text.split())
+        if len(normalized) <= 120:
+            short_progress_prefixes = (
+                "让我",
+                "让我先",
+                "先让我",
+                "我来",
+                "我先",
+                "先读取",
+                "先搜索",
+                "开始",
+                "接下来我",
+                "现在让我",
+            )
+            if normalized.startswith(short_progress_prefixes):
+                return True
+
         if text.endswith((":", "：")):
             return True
 
@@ -893,9 +1045,15 @@ class CodeMateAgent:
             "下一步",
             "将会",
             "我会",
+            "我来",
+            "我先",
+            "让我",
             "立即",
             "再次执行",
             "继续执行",
+            "继续搜索",
+            "继续读取",
+            "继续查找",
             "验证",
             # 英文关键词（LLM 偶尔混合语境回答时使用）
             "working on",
@@ -985,14 +1143,16 @@ class CodeMateAgent:
 
     def _has_unfinished_plan(self) -> bool:
         """判断当前计划是否仍有未完成任务。"""
-        if not (self.planning_enabled and self.planner and self.planner.current_plan is not None):
-            return False
-
         from codemate_agent.tools.todo.todo_write import TodoWriteTool
 
         todo_state = TodoWriteTool.get_current_state()
         if not todo_state:
-            return not self._todo_all_completed
+            return bool(
+                self.planning_enabled
+                and self.planner
+                and self.planner.current_plan is not None
+                and not self._todo_all_completed
+            )
 
         stats = todo_state.get("stats", {})
         pending = int(stats.get("pending", 0))
@@ -1006,6 +1166,117 @@ class CodeMateAgent:
         if total > 0 and completed + cancelled >= total:
             return False
         return not self._todo_all_completed
+
+    def _team_strict_status(self) -> dict[str, Any]:
+        if not self.team:
+            return {}
+        status = self.team.get_status()
+        if not status.get("strict_mode"):
+            return {}
+        progress = status.get("strict_progress", {})
+        if not isinstance(progress, dict):
+            return {}
+        return progress
+
+    def _build_team_completion_intervention(self) -> str:
+        progress = self._team_strict_status()
+        if not progress:
+            return ""
+        if int(progress.get("session_task_count", 0)) <= 0:
+            return ""
+        if progress.get("reviewer_done"):
+            return ""
+        missing: list[str] = []
+        if not progress.get("researcher_done"):
+            missing.append("researcher")
+        if not progress.get("builder_done"):
+            missing.append("builder")
+        if not progress.get("reviewer_done"):
+            missing.append("reviewer")
+        needed = " -> ".join(missing) if missing else "reviewer"
+        return (
+            "TEAM_STRICT_MODE: 当前会话已进入团队流程，但阶段尚未完成。"
+            f"缺失阶段: {needed}。请继续使用 task 工具按阶段委托，"
+            "完成 reviewer 验收后再给最终答案。"
+        )
+
+    def _build_team_tool_intervention(self, tool_name: str) -> str:
+        progress = self._team_strict_status()
+        if not progress:
+            return ""
+        blocked_tools = {
+            "write_file",
+            "append_file",
+            "write_file_chunks",
+            "append_file_chunks",
+            "edit_file",
+            "delete_file",
+            "run_shell",
+            "background_run",
+        }
+        if tool_name not in blocked_tools:
+            return ""
+        return (
+            "TEAM_STRICT_MODE: lead 不允许直接调用写入/shell 类工具。"
+            "请使用 task 工具并显式指定 agent_id 委托成员执行："
+            "researcher(调研) -> builder(实现) -> reviewer(验收)。"
+        )
+
+    def _is_transient_llm_error(self, error_text: str) -> bool:
+        probe = (error_text or "").lower()
+        transient_markers = (
+            "server_error",
+            "http_code': '500",
+            '"http_code": "500',
+            " 500 ",
+            "(1000)",
+            " 520 ",
+            "connection",
+            "timeout",
+            "temporarily",
+            "rate limit",
+            " 429 ",
+        )
+        return any(marker in probe for marker in transient_markers)
+
+    def _repair_tool_protocol_history(self, error_detail: str) -> None:
+        """MiniMax 工具协议链损坏后，将历史工具轮次扁平化为纯文本再继续。"""
+        repaired_messages: list[Message] = []
+        for msg in self.messages:
+            if msg.role == "tool":
+                tool_name = msg.name or "tool"
+                repaired_messages.append(
+                    Message(role="assistant", content=f"[{tool_name} output]\n{msg.content or ''}")
+                )
+                continue
+
+            if msg.role == "assistant" and msg.tool_calls:
+                content = (msg.content or "").strip() or "[Tool call context omitted for compatibility]"
+                repaired_messages.append(Message(role="assistant", content=content))
+                continue
+
+            repaired_messages.append(
+                Message(role=msg.role, content=msg.content or "")
+            )
+
+        repaired_messages.append(
+            Message(
+                role="system",
+                content=(
+                    "检测到上一轮工具协议历史与 MiniMax 不兼容，已将旧工具轨迹压平成纯文本继续。"
+                    "接下来只能使用真实工具调用；不要在回答中模拟 [tool output]、tool_call 或 invoke 标签。"
+                    f" 原始错误: {error_detail}"
+                ),
+            )
+        )
+
+        self.messages = repaired_messages
+        self.loop_guard.reset_premature()
+        self.loop_detector.reset()
+        self._emit_progress(
+            "runtime_warning",
+            {"message": "检测到工具协议链损坏，已重建历史后继续执行"},
+        )
 
     def _execute_tool_call(self, tool_call: ToolCall) -> str:
         """
@@ -1027,6 +1298,7 @@ class CodeMateAgent:
         """
         tool_name = tool_call.function.name      # 工具名称，如 "read_file"
         arguments = tool_call.function.arguments # 工具参数，如 {"file_path": "main.py"}
+        tool_name, arguments, normalization_note = self._normalize_file_write_call(tool_name, arguments)
 
         # 参数验证：检测可疑的参数值（GLM API 有时会返回类型名称而非实际值）
         validation_error = self._validate_arguments(tool_name, arguments)
@@ -1039,6 +1311,10 @@ class CodeMateAgent:
                 usage_hint = self._get_tool_usage_hint(tool_name, tool)
                 return f"错误: {validation_error}\n\n{usage_hint}"
             return f"错误: {validation_error}。请提供正确的参数值。"
+
+        team_tool_intervention = self._build_team_tool_intervention(tool_name)
+        if team_tool_intervention:
+            return f"错误: {team_tool_intervention}"
 
         if tool_name == "run_shell" and self.team:
             self.team.sync_shell_context()
@@ -1086,6 +1362,8 @@ class CodeMateAgent:
             # 通过工具注册器执行工具
             # 注册器会根据工具名称找到对应的工具实例并执行
             result = self.tool_registry.execute(tool_name, **arguments)
+            if normalization_note and not self.loop_guard.is_error_result(str(result)):
+                result = f"{result}\n{normalization_note}"
 
             # 截断过长的工具输出
             if not self.truncator.should_skip_truncation(tool_name):
@@ -1112,6 +1390,8 @@ class CodeMateAgent:
 
             if self.metrics:
                 self.metrics.record_tool_call(tool_name, success=not is_error)
+                if is_error:
+                    self.metrics.record_error()
             self._emit_team_event("tool_result", {"tool": tool_name, "success": not is_error})
 
             return result
@@ -1145,6 +1425,39 @@ class CodeMateAgent:
 
             return error_msg
 
+    def _normalize_file_write_call(self, tool_name: str, arguments: dict) -> tuple[str, dict, str]:
+        """将超长 write/append 请求自动转换为 chunk 工具，减少模型反复失败。"""
+        if tool_name not in {"write_file", "append_file"}:
+            return tool_name, arguments, ""
+        if not isinstance(arguments, dict):
+            return tool_name, arguments, ""
+
+        file_path = arguments.get("file_path")
+        content = arguments.get("content")
+        if not isinstance(file_path, str) or not file_path.strip():
+            return tool_name, arguments, ""
+        if not isinstance(content, str) or len(content) <= MAX_INLINE_FILE_CONTENT:
+            return tool_name, arguments, ""
+
+        chunk_tool = "write_file_chunks" if tool_name == "write_file" else "append_file_chunks"
+        chunks = [
+            content[i:i + MAX_INLINE_FILE_CONTENT]
+            for i in range(0, len(content), MAX_INLINE_FILE_CONTENT)
+        ]
+        normalized_arguments = {"file_path": file_path, "chunks": chunks}
+        note = (
+            f"ℹ️ 已自动将超长 {tool_name} 请求转换为 {chunk_tool}"
+            f"（{len(content)} 字符 / {len(chunks)} 块）。"
+        )
+        self.logger.info(
+            "自动转换超长文件写入: %s -> %s (%s chars, %s chunks)",
+            tool_name,
+            chunk_tool,
+            len(content),
+            len(chunks),
+        )
+        return chunk_tool, normalized_arguments, note
+
     def _get_system_prompt(self, query: str = "") -> str:
         """
         获取完整的系统提示词
@@ -1160,8 +1473,47 @@ class CodeMateAgent:
         """
         prompt_parts = [SYSTEM_PROMPT]  # 使用模块级常量
 
-        # 添加长期记忆
-        if self.memory_manager:
+        prompt_parts.append(
+            "\n## 当前运行时\n"
+            f"- 当前工作目录: {self.workspace_dir}\n"
+            "- 所有文件与命令都必须基于这个真实工作目录，不要臆测其他路径。"
+        )
+        if (
+            os.getenv("TEAM_AGENT_ENABLED", "false").lower() == "true"
+            and os.getenv("TEAM_STRICT_MODE", "false").lower() == "true"
+        ):
+            prompt_parts.append(
+                "\n## TEAM_STRICT_MODE 约束\n"
+                "- 你当前是 lead，禁止直接调用写入类工具：write_file/append_file/write_file_chunks/append_file_chunks/edit_file/delete_file。\n"
+                "- 必须按顺序委托：researcher（调研）-> builder（实现）-> reviewer（验收）。\n"
+                "- 委托时优先使用 agent_id（示例：task(agent_id='researcher', description='...', prompt='...')）。\n"
+                "- 如需产出文件，先用 task 工具委托 builder 执行写入，再由 reviewer 验收后才能给最终答案。"
+            )
+
+        # 添加 RepoRAG 项目上下文；若未启用则回退到原有长期记忆
+        if self.repo_rag is not None and self._should_use_repo_rag(query):
+            repo_context = self.repo_rag.retrieve(query)
+            prompt_text = repo_context.to_prompt_text()
+            if prompt_text:
+                self._emit_progress(
+                    "repo_rag_retrieved",
+                    {
+                        "query": query,
+                        "chunks": len(repo_context.chunks),
+                        "sources": repo_context.paths,
+                        "source_count": repo_context.source_count,
+                        "total_chars": repo_context.total_chars,
+                    },
+                )
+                prompt_parts.append(f"\n{prompt_text}")
+                self.logger.debug(
+                    "[repo_rag] query=%r chunks=%s chars=%s sources=%s",
+                    query[:80],
+                    len(repo_context.chunks),
+                    repo_context.total_chars,
+                    [chunk.path or chunk.source for chunk in repo_context.chunks],
+                )
+        elif self.memory_manager:
             memory = self.memory_manager.retrieve_relevant_memory(query, top_k=3)
             if memory.strip() and not memory.startswith("# 长期记忆\n\n暂无"):
                 prompt_parts.append(f"\n## 长期记忆\n{memory}")
@@ -1180,6 +1532,45 @@ class CodeMateAgent:
         prompt_parts.append(f"\n## 可用工具\n{tools_desc}")
 
         return "\n".join(prompt_parts)
+
+    def inspect_repo_rag(self, query: str, top_k: int | None = None):
+        """手动查看 RepoRAG 的检索结果。"""
+        if self.repo_rag is None:
+            return None
+        return self.repo_rag.retrieve(query, top_k=top_k)
+
+    def _should_use_repo_rag(self, query: str) -> bool:
+        """对明显的寒暄/空泛输入跳过 RepoRAG，减少噪音与无效检索。"""
+        text = " ".join((query or "").strip().lower().split())
+        if not text:
+            return False
+
+        greeting_phrases = {
+            "hi",
+            "hello",
+            "hey",
+            "你好",
+            "您好",
+            "嗨",
+            "在吗",
+            "早上好",
+            "下午好",
+            "晚上好",
+        }
+        if text in greeting_phrases:
+            return False
+
+        short_phatic_prefixes = (
+            "hello ",
+            "hi ",
+            "hey ",
+            "你好 ",
+            "您好 ",
+        )
+        if any(text.startswith(prefix) for prefix in short_phatic_prefixes) and len(text) <= 20:
+            return False
+
+        return True
 
     def _detect_skill_declaration(self, content: str) -> Optional[str]:
         """
@@ -1230,6 +1621,65 @@ class CodeMateAgent:
         self.messages.append(Message(role="assistant", content="", tool_calls=[synthetic_call]))
         self.messages.append(Message(role="tool", content=skill_content, tool_call_id=call_id, name="skill"))
 
+    def _load_skill_content(self, skill_name: str, arguments: str, mode: str) -> Optional[str]:
+        """
+        加载 skill 内容，并通过进度事件显式记录为一次 skill 工具调用。
+
+        优先走真实 skill 工具（可审计），若工具不可用再回退到 SkillManager 直读。
+        """
+        tool_args = {"action": "load", "skill_name": skill_name}
+        self._emit_progress(
+            "tool_call_start",
+            {
+                "tool": "skill",
+                "args": f"action=load, skill_name={skill_name}",
+                "arguments": tool_args,
+            },
+        )
+        self.heartbeat.emit("tool_call_start", source="tool", tool="skill")
+        self._emit_team_event("tool_call_start", {"tool": "skill", "mode": mode})
+        tool_start = time.time()
+
+        result = ""
+        success = False
+        skill_tool = self.tool_registry.get("skill")
+        if skill_tool is not None:
+            tool_call = ToolCall(
+                id=f"call_skill_load_{uuid.uuid4().hex[:8]}",
+                type="function",
+                function=FunctionCall(name="skill", arguments=tool_args),
+            )
+            result = str(self._execute_tool_call(tool_call))
+            success = not self.loop_guard.is_error_result(result)
+
+        if not success:
+            fallback = self.skill_manager.prepare_execution(skill_name, arguments)
+            if fallback:
+                result = fallback
+                success = True
+
+        duration_ms = (time.time() - tool_start) * 1000
+        self.heartbeat.emit(
+            "tool_call_end",
+            source="tool",
+            tool="skill",
+            duration_ms=round(duration_ms, 2),
+        )
+        self._emit_team_event(
+            "tool_call_end",
+            {"tool": "skill", "mode": mode, "duration_ms": round(duration_ms, 2), "success": success},
+        )
+        self._emit_progress(
+            "tool_call_end",
+            {
+                "tool": "skill",
+                "success": success,
+                "result_preview": self._summarize_tool_result("skill", result),
+                "duration_ms": round(duration_ms, 2),
+            },
+        )
+        return result if success else None
+
     def _handle_skill_command(self, query: str) -> Optional[str]:
         """
         处理 skill 命令
@@ -1253,7 +1703,7 @@ class CodeMateAgent:
             return None  # 不是 skill 命令，继续正常处理
         
         # 加载完整 skill 内容
-        skill_prompt = self.skill_manager.prepare_execution(skill_name, arguments)
+        skill_prompt = self._load_skill_content(skill_name, arguments, mode="manual")
         if not skill_prompt:
             return None
 
@@ -1286,7 +1736,7 @@ class CodeMateAgent:
         if not skill_name or not self.skill_manager.skill_exists(skill_name):
             return None
 
-        skill_prompt = self.skill_manager.prepare_execution(skill_name, query)
+        skill_prompt = self._load_skill_content(skill_name, query, mode="auto")
         if not skill_prompt:
             return None
 

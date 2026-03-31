@@ -7,6 +7,7 @@ UI 模块
 from .display import (
     console,
     print_banner,
+    print_startup_summary,
     print_help,
     print_stats,
     print_tools,
@@ -21,6 +22,7 @@ from .progress import ProgressDisplay
 __all__ = [
     "console",
     "print_banner",
+    "print_startup_summary",
     "print_help",
     "print_stats",
     "print_tools",

@@ -5,6 +5,7 @@ CodeMate AI CLI
 """
 
 import argparse
+import re
 import sys
 from pathlib import Path
 from typing import Optional
@@ -25,13 +26,127 @@ from codemate_agent.tools import get_all_tools
 from codemate_agent.logging import setup_logger, TraceLogger, SessionMetrics, generate_session_id, TraceEventType
 from codemate_agent.persistence import SessionStorage, MemoryManager, SessionIndex
 from codemate_agent.context import CompressionConfig
-from codemate_agent.ui import console, print_banner, print_help, ProgressDisplay
+from codemate_agent.ui import console, print_banner, print_help, print_startup_summary, ProgressDisplay
 from codemate_agent.commands import handle_command
 
 
 def _print_cli_error(prefix: str, detail: object) -> None:
     """安全打印错误，避免 Rich 将错误文本中的方括号当作 markup 解析。"""
     console.print(f"{prefix}: {detail}", style="red", markup=False)
+
+
+def _plain_panel(content: object, *, title: str, border_style: str) -> Panel:
+    """使用纯文本 renderable 构造 Panel，避免 Rich 解析动态 markup。"""
+    return Panel(Text(str(content or "")), title=title, border_style=border_style)
+
+
+def _strip_hidden_reasoning(text: str) -> str:
+    """移除泄露到最终回答中的 think 块和 MiniMax 工具协议残片。"""
+    cleaned = text or ""
+    cleanup_patterns = (
+        r"<think>.*?</think>",
+        r"<minimax:tool_call>.*?</minimax:tool_call>",
+        r"<invoke\b[^>]*>.*?</invoke>",
+        r"</?(?:parameter|minimax:tool_call|invoke)\b[^>]*>",
+        r"\[tool_call\].*?\[/tool_call\]",
+        r"\[invoke\b[^\]]*\].*?\[/invoke\]",
+        r"\[/?(?:tool_call|invoke|parameter)\b[^\]]*\]",
+    )
+    for pattern in cleanup_patterns:
+        cleaned = re.sub(pattern, "", cleaned, flags=re.DOTALL | re.IGNORECASE)
+
+    lines = []
+    for raw_line in cleaned.splitlines():
+        line = raw_line.strip()
+        if not line:
+            lines.append("")
+            continue
+        if line.startswith(("@@", "---", "+++", "[PATH]")):
+            continue
+        if any(token in line.lower() for token in (
+            "<parameter",
+            "</parameter>",
+            "</invoke>",
+            "[parameter",
+            "[/parameter]",
+            "[invoke",
+            "[/invoke]",
+            "[tool_call]",
+            "[/tool_call]",
+        )):
+            continue
+        lines.append(raw_line)
+
+    cleaned = "\n".join(lines)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned, flags=re.DOTALL).strip()
+    return cleaned or (text or "").strip()
+
+
+def _find_existing_artifacts(text: str, cwd: Path) -> list[Path]:
+    """从回答中提取并验证存在的产物路径。"""
+    normalized_text = text or ""
+    artifact_context_markers = (
+        "已生成",
+        "已创建",
+        "已写入",
+        "created",
+        "generated",
+        "written to",
+        "输出到",
+    )
+    if not any(marker.lower() in normalized_text.lower() for marker in artifact_context_markers):
+        return []
+
+    candidates: set[str] = set()
+
+    artifact_line_patterns = (
+        r"(?:已生成|已创建|已写入|输出到)\S*[:：]?\s*`([^`\n]+)`",
+        r"(?:created|generated|written to)\s+`([^`\n]+)`",
+        r"(?:已生成|已创建|已写入|输出到)\S*[:：]?\s*((?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+)",
+        r"(?:created|generated|written to)\s+((?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+)",
+    )
+
+    for pattern in artifact_line_patterns:
+        for match in re.findall(pattern, normalized_text, flags=re.IGNORECASE):
+            candidates.add(match.strip())
+
+    for match in re.findall(r"`([^`\n]+)`", normalized_text):
+        candidates.add(match.strip())
+
+    resolved: list[Path] = []
+    seen: set[Path] = set()
+    for candidate in candidates:
+        raw = Path(candidate)
+        path = raw if raw.is_absolute() else cwd / raw
+        try:
+            normalized = path.resolve()
+        except OSError:
+            continue
+        if normalized.exists() and normalized.is_file() and normalized not in seen:
+            seen.add(normalized)
+            resolved.append(normalized)
+    return resolved
+
+
+def _show_artifact_summary(result: str, cwd: Path) -> None:
+    """显示回答中提及且实际存在的产物文件。"""
+    artifacts = _find_existing_artifacts(result, cwd)
+    if not artifacts:
+        return
+
+    table = Table(show_header=True, header_style="bold magenta")
+    table.add_column("产物", style="cyan")
+    table.add_column("大小", justify="right")
+
+    for artifact in artifacts:
+        try:
+            rel = artifact.relative_to(cwd)
+            label = str(rel)
+        except ValueError:
+            label = str(artifact)
+        table.add_row(label, f"{artifact.stat().st_size} bytes")
+
+    console.print(Panel(table, title="[bold]已验证产物[/bold]", border_style="cyan"))
 
 
 def _classify_shell_risk(command: str) -> str:
@@ -73,19 +188,8 @@ def run_interactive(config: Config) -> None:
     setup_logger("codemate", level=config.log_level)
 
     # 显示配置信息
-    config_table = Table(show_header=False, show_edge=False)
-    config_table.add_column("配置项", style="cyan")
-    config_table.add_column("值", style="yellow")
-    config_table.add_row("模型", config.model)
-    config_table.add_row("最大轮数", str(config.max_rounds))
-    config_table.add_row("日志级别", config.log_level)
-    config_table.add_row("Trace 日志", "启用" if config.trace_enabled else "禁用")
-    config_table.add_row("Metrics 统计", "启用" if config.metrics_enabled else "禁用")
-    config_table.add_row("对话持久化", "启用" if config.persistence_enabled else "禁用")
-    config_table.add_row("上下文压缩", "启用" if config.persistence_enabled else "禁用")  # 与持久化同步
-    config_table.add_row("任务规划", "启用" if config.persistence_enabled else "禁用")  # 与持久化同步
-    config_table.add_row("工作目录", str(Path.cwd()))
-    console.print(Panel(config_table, title="[bold]✨ 当前配置[/bold]", border_style="bright_magenta"))
+    config.cwd = Path.cwd()
+    print_startup_summary(config)
     console.print("")
 
     # 初始化日志系统
@@ -126,7 +230,7 @@ def run_interactive(config: Config) -> None:
             plan_text: TodoWrite 返回的计划文本
         """
         console.print(f"\n[cyan]▶ 生成执行计划[/cyan]")
-        console.print(Panel(plan_text, border_style="cyan", padding=(0, 1)))
+        console.print(Panel(Text(plan_text), border_style="cyan", padding=(0, 1)))
         console.print("")  # 空行
 
     # 创建进度显示实例
@@ -159,6 +263,9 @@ def run_interactive(config: Config) -> None:
             planning_enabled=config.persistence_enabled,
             plan_display_callback=plan_display_callback,
             progress_callback=progress_display.on_event,
+            repo_rag_enabled=config.repo_rag_enabled,
+            repo_rag_top_k=config.repo_rag_top_k,
+            repo_rag_char_budget=config.repo_rag_char_budget,
         )
     except Exception as e:
         _print_cli_error("初始化失败", e)
@@ -287,9 +394,11 @@ def run_interactive(config: Config) -> None:
 
             try:
                 result = agent.run(user_input)
+                display_result = _strip_hidden_reasoning(result)
 
                 # 显示结果
-                console.print(Panel(result, title="[bold green]答案[/bold green]", border_style="green"))
+                console.print(_plain_panel(display_result, title="[bold green]答案[/bold green]", border_style="green"))
+                _show_artifact_summary(display_result, Path.cwd())
 
                 # 显示统计
                 stats = agent.get_stats()
@@ -360,7 +469,7 @@ def run_single_prompt(prompt: str, config: Config) -> None:
     # 定义计划显示回调函数（单次模式使用简单的 console.print）
     def plan_display_callback(plan_text: str) -> None:
         console.print(f"\n[cyan]▶ 生成执行计划[/cyan]")
-        console.print(Panel(plan_text, border_style="cyan", padding=(0, 1)))
+        console.print(Panel(Text(plan_text), border_style="cyan", padding=(0, 1)))
         console.print("")
 
     # 创建进度显示实例（单次模式也启用进度显示）
@@ -403,7 +512,9 @@ def run_single_prompt(prompt: str, config: Config) -> None:
 
     try:
         result = agent.run(prompt)
-        console.print(Panel(result, title="[bold green]答案[/bold green]", border_style="green"))
+        display_result = _strip_hidden_reasoning(result)
+        console.print(_plain_panel(display_result, title="[bold green]答案[/bold green]", border_style="green"))
+        _show_artifact_summary(display_result, Path.cwd())
 
         stats = agent.get_stats()
         console.print(f"\n[dim]轮数: {stats['round_count']} | Tokens: {stats['total_tokens']}[/dim]")

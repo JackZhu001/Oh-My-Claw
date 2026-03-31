@@ -5,12 +5,19 @@ TaskTool 作为薄适配层，委托 SubagentRunner 执行子代理任务并格�
 """
 
 import logging
+import hashlib
+import os
+import re
 import time
 import uuid
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 from codemate_agent.llm.client import LLMClient as GLMClient
 from codemate_agent.prompts.agents_prompts import get_default_model
+from codemate_agent.schema import Message
+from codemate_agent.skill import SkillManager
+from codemate_agent.team.coordinator import StrictWorkflowError
+from codemate_agent.team.definitions import ExecutionResult
 from codemate_agent.tools.base import Tool
 from codemate_agent.tools.registry import ToolRegistry
 from codemate_agent.validation import ArgumentValidator
@@ -44,6 +51,18 @@ class TaskTool(Tool):
     # 智能摘要配置
     DEFAULT_SUMMARY_THRESHOLD = 1500  # 超过此长度触发摘要
     SUMMARY_CACHE_TTL = 300  # 摘要缓存有效期（秒）
+    TEAM_ROLE_SUBAGENT_ALIASES = {
+        "researcher": "explore",
+        "builder": "general",
+        "reviewer": "summary",
+        "lead": "plan",
+    }
+    SKILL_DECLARATION_PATTERNS = (
+        r"\[使用\s*Skill[:\s]*([a-zA-Z0-9_-]+)\]",
+        r"\[Using\s*Skill[:\s]*([a-zA-Z0-9_-]+)\]",
+        r"\[Skill[:\s]*([a-zA-Z0-9_-]+)\]",
+    )
+    MAX_CONTEXT_SUMMARY_CHARS = 1200
     
     def __init__(self, working_dir: str = "."):
         super().__init__()
@@ -55,6 +74,9 @@ class TaskTool(Tool):
         self._light_llm_client: Optional[GLMClient] = None
         # 工具注册器
         self._tool_registry: Optional[ToolRegistry] = None
+        self._team_coordinator = None
+        self._delegate_handler: Optional[Callable[..., ExecutionResult]] = None
+        self._skill_manager = SkillManager()
         
         # 摘要缓存
         self._summary_cache: Dict[str, Tuple[str, float]] = {}
@@ -64,6 +86,8 @@ class TaskTool(Tool):
         main_llm_client: GLMClient,
         tool_registry: ToolRegistry,
         light_llm_client: Optional[GLMClient] = None,
+        team_coordinator=None,
+        delegate_handler: Optional[Callable[..., ExecutionResult]] = None,
     ):
         """
         设置依赖（由 Agent 注入）
@@ -76,6 +100,11 @@ class TaskTool(Tool):
         self._main_llm_client = main_llm_client
         self._light_llm_client = light_llm_client or main_llm_client
         self._tool_registry = tool_registry
+        self._team_coordinator = team_coordinator
+        self._delegate_handler = delegate_handler
+
+    def set_delegate_handler(self, handler: Optional[Callable[..., ExecutionResult]]) -> None:
+        self._delegate_handler = handler
     
     @property
     def name(self) -> str:
@@ -132,14 +161,39 @@ class TaskTool(Tool):
                 },
                 "subagent_type": {
                     "type": "string",
-                    "enum": ["general", "explore", "plan", "summary"],
+                    "enum": [
+                        "general",
+                        "explore",
+                        "plan",
+                        "summary",
+                        "researcher",
+                        "builder",
+                        "reviewer",
+                        "lead",
+                    ],
                     "description": "子代理类型，默认为 general"
                 },
                 "model": {
                     "type": "string",
                     "enum": ["main", "light"],
                     "description": "模型选择，默认根据类型自动选择"
-                }
+                },
+                "agent_id": {
+                    "type": "string",
+                    "description": "指定团队成员（可选，如 researcher/builder/reviewer/lead）",
+                },
+                "context_summary": {
+                    "type": "string",
+                    "description": "补充上下文摘要（可选）",
+                },
+                "skill_context": {
+                    "type": "string",
+                    "description": "补充 skill 上下文（可选）",
+                },
+                "skill_name": {
+                    "type": "string",
+                    "description": "指定关联的 skill 名称（可选）",
+                },
             },
             "required": ["description", "prompt"]
         }
@@ -158,14 +212,16 @@ class TaskTool(Tool):
             str: 格式化的结果字符串
         """
         # 检查依赖
-        if not self._main_llm_client or not self._tool_registry:
+        if self._main_llm_client is None or self._tool_registry is None:
             return self._format_error("INTERNAL_ERROR", "Task 工具未正确初始化（缺少依赖）")
         
         # 提取参数
         description = kwargs.get("description", "")
         prompt = kwargs.get("prompt", "")
-        subagent_type = kwargs.get("subagent_type", "general")
+        raw_subagent_type = (kwargs.get("subagent_type", "general") or "general").strip().lower()
+        subagent_type = self._normalize_subagent_type(raw_subagent_type)
         model = kwargs.get("model")
+        requested_agent_id = (kwargs.get("agent_id") or "").strip()
         
         # 参数验证
         validation_error = ArgumentValidator.validate("task", kwargs)
@@ -174,11 +230,60 @@ class TaskTool(Tool):
         
         # 验证子代理类型
         if subagent_type not in SUBAGENT_TYPES:
+            supported = list(SUBAGENT_TYPES.keys()) + list(self.TEAM_ROLE_SUBAGENT_ALIASES.keys())
             return self._format_error(
                 "INVALID_PARAM",
-                f"不支持的子代理类型: {subagent_type}。"
-                f"支持的类型: {list(SUBAGENT_TYPES.keys())}"
+                f"不支持的子代理类型: {raw_subagent_type}。"
+                f"支持的类型: {supported}"
             )
+
+        if self._delegate_handler is not None or self._team_coordinator is not None:
+            strict_mode = self._is_team_strict_mode_enabled()
+            if strict_mode and not requested_agent_id:
+                return self._format_error(
+                    "TEAM_STRICT_VIOLATION",
+                    "TEAM_STRICT_MODE 约束：使用 task 进行团队委托时必须显式传入 agent_id "
+                    "(researcher/builder/reviewer/lead)，禁止仅靠 subagent_type 隐式路由。",
+                )
+            target_agent = requested_agent_id or self._map_subagent_to_member(raw_subagent_type)
+            context_summary = self._build_delegation_context(
+                description=description,
+                prompt=prompt,
+                raw_subagent_type=raw_subagent_type,
+                target_agent=target_agent,
+                kwargs=kwargs,
+            )
+            try:
+                start_time = time.time()
+                if self._delegate_handler is not None:
+                    delegated_result = self._delegate_handler(
+                        agent_id=target_agent,
+                        title=description,
+                        instructions=prompt,
+                        context_summary=context_summary,
+                        cwd=self._working_dir,
+                    )
+                else:
+                    delegated_result = self._team_coordinator.dispatch_to(
+                        agent_id=target_agent,
+                        title=description,
+                        instructions=prompt,
+                        context_summary=context_summary,
+                        delegated_by="lead",
+                        cwd=self._working_dir,
+                    )
+                duration_ms = int((time.time() - start_time) * 1000)
+                return self._format_delegated_success(
+                    delegated_result=delegated_result,
+                    duration_ms=duration_ms,
+                    params_input=kwargs,
+                    member=target_agent,
+                )
+            except StrictWorkflowError as e:
+                return self._format_error("TEAM_STRICT_VIOLATION", str(e))
+            except Exception as e:
+                logger.error("团队调度失败: %s", e)
+                return self._format_error("TEAM_DISPATCH_ERROR", str(e))
         
         # 确定使用的模型
         if model is None:
@@ -187,7 +292,6 @@ class TaskTool(Tool):
         llm_client = self._light_llm_client if model == "light" else self._main_llm_client
         
         # 获取最大步数
-        import os
         max_steps = int(os.getenv("SUBAGENT_MAX_STEPS", "15"))
         
         # 创建并运行子代理
@@ -216,6 +320,47 @@ class TaskTool(Tool):
         
         # 格式化响应
         return self._format_success(result, duration_ms, kwargs)
+
+    def _format_delegated_success(
+        self,
+        *,
+        delegated_result: ExecutionResult,
+        duration_ms: int,
+        params_input: Dict[str, Any],
+        member: str,
+    ) -> str:
+        content = delegated_result.summary or "No summary returned."
+        if len(content) > self.DEFAULT_SUMMARY_THRESHOLD:
+            content = self._truncate_content(content)
+        response = TaskResponse(
+            status="success" if delegated_result.success else "error",
+            data={
+                "status": delegated_result.status,
+                "result": content,
+                "tool_summary": [
+                    {"tool": tool, "count": count}
+                    for tool, count in delegated_result.tool_usage.items()
+                ],
+                "model_used": member,
+                "subagent_type": f"team:{member}",
+                "artifact_paths": delegated_result.artifact_paths,
+                "artifact_manifest_path": delegated_result.artifact_manifest_path,
+                "session_id": delegated_result.session_id,
+            },
+            text=content,
+            stats={
+                "time_ms": duration_ms,
+                "tool_calls": sum(delegated_result.tool_usage.values()),
+                "steps": 0,
+                "model": member,
+            },
+            context={
+                "cwd": str(self._working_dir),
+                "params_input": params_input,
+                "error": delegated_result.error,
+            },
+        )
+        return response.to_text()
     
     def _format_success(
         self,
@@ -375,3 +520,92 @@ class TaskTool(Tool):
         ]
         for key in expired:
             del self._summary_cache[key]
+
+    def _map_subagent_to_member(self, subagent_type: str) -> str:
+        normalized = (subagent_type or "general").strip().lower()
+        if normalized in self.TEAM_ROLE_SUBAGENT_ALIASES:
+            return normalized
+        if normalized == "explore":
+            return "researcher"
+        if normalized == "summary":
+            return "reviewer"
+        if normalized == "plan":
+            return "lead"
+        return "builder"
+
+    def _normalize_subagent_type(self, subagent_type: str) -> str:
+        normalized = (subagent_type or "general").strip().lower()
+        if normalized in SUBAGENT_TYPES:
+            return normalized
+        return self.TEAM_ROLE_SUBAGENT_ALIASES.get(normalized, normalized)
+
+    @staticmethod
+    def _is_team_strict_mode_enabled() -> bool:
+        return os.getenv("TEAM_STRICT_MODE", "false").strip().lower() == "true"
+
+    def _build_delegation_context(
+        self,
+        *,
+        description: str,
+        prompt: str,
+        raw_subagent_type: str,
+        target_agent: str,
+        kwargs: Dict[str, Any],
+    ) -> str:
+        sections: list[str] = []
+        user_context_summary = (kwargs.get("context_summary") or "").strip()
+        if user_context_summary:
+            sections.append(user_context_summary)
+
+        skill_context = (kwargs.get("skill_context") or "").strip()
+        if skill_context:
+            sections.append(f"Skill context:\n{skill_context}")
+
+        skill_name = self._resolve_skill_name(description=description, prompt=prompt, kwargs=kwargs)
+        if skill_name:
+            sections.append(
+                "Detected skill hint:\n"
+                f"- {skill_name}\n"
+                "- Delegatee should call skill tool to load full guidance before implementation."
+            )
+
+        sections.append(
+            "Delegation metadata:\n"
+            f"- target_agent: {target_agent}\n"
+            f"- requested_subagent_type: {(raw_subagent_type or 'general').strip().lower() or 'general'}"
+        )
+
+        combined = "\n\n".join(part for part in sections if part).strip()
+        if len(combined) <= self.MAX_CONTEXT_SUMMARY_CHARS:
+            return combined
+        return combined[: self.MAX_CONTEXT_SUMMARY_CHARS].rstrip() + "\n...(truncated)"
+
+    def _resolve_skill_name(self, *, description: str, prompt: str, kwargs: Dict[str, Any]) -> str:
+        explicit = (kwargs.get("skill_name") or "").strip()
+        if explicit:
+            return explicit
+
+        stripped_prompt = (prompt or "").strip()
+        if stripped_prompt.startswith("/"):
+            maybe = stripped_prompt[1:].split(maxsplit=1)[0].strip()
+            if maybe and self._skill_manager.skill_exists(maybe):
+                return maybe
+
+        declared = self._extract_declared_skill(stripped_prompt)
+        if declared:
+            return declared
+
+        candidate = self._skill_manager.match_skill_by_keywords(f"{description}\n{prompt}")
+        if candidate and self._skill_manager.skill_exists(candidate):
+            return candidate
+        return ""
+
+    def _extract_declared_skill(self, content: str) -> str:
+        for pattern in self.SKILL_DECLARATION_PATTERNS:
+            match = re.search(pattern, content, re.IGNORECASE)
+            if not match:
+                continue
+            skill_name = match.group(1).strip()
+            if skill_name and self._skill_manager.skill_exists(skill_name):
+                return skill_name
+        return ""

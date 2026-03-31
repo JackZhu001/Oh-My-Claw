@@ -1,9 +1,13 @@
 import threading
 
 from codemate_agent.agent.agent import CodeMateAgent
+from codemate_agent.agent.team_runtime import TeamRuntime
 from codemate_agent.commands.handler import handle_command
 from codemate_agent.schema import LLMResponse
+from codemate_agent.schema import Message
+from codemate_agent.team.coordinator import TeamCoordinator
 from codemate_agent.team import MessageBus, RequestTracker, TaskBoard
+from codemate_agent.tools.registry import ToolRegistry
 
 
 class TeamDummyLLM:
@@ -11,6 +15,13 @@ class TeamDummyLLM:
 
     def complete(self, messages, tools=None):
         return LLMResponse(content="done", tool_calls=None, finish_reason="stop", usage=None)
+
+
+class DelegationDummyLLM:
+    model = "delegation-model"
+
+    def complete(self, messages, tools=None):
+        return LLMResponse(content="delegated", tool_calls=None, finish_reason="stop", usage=None)
 
 
 def test_message_bus_read_and_drain(tmp_path):
@@ -89,7 +100,7 @@ def test_agent_team_runtime_ingests_inbox_and_commands(monkeypatch, tmp_path):
     result = agent.run("hello")
     assert result == "done"
     assert any("<identity>" in (m.content or "") for m in agent.messages if m.role == "system")
-    assert any("<team_message>" in (m.content or "") for m in agent.messages if m.role == "system")
+    assert any("<team_update>" in (m.content or "") for m in agent.messages if m.role == "system")
 
     status = agent.get_team_status()
     assert status["enabled"] is True
@@ -99,3 +110,61 @@ def test_agent_team_runtime_ingests_inbox_and_commands(monkeypatch, tmp_path):
     handle_command("/team", agent)
     handle_command("/inbox", agent)
     handle_command("/tasks", agent)
+
+
+def test_team_runtime_status_includes_dispatch_metadata(tmp_path):
+    coordinator = TeamCoordinator(
+        workspace_dir=tmp_path,
+        main_llm_client=DelegationDummyLLM(),
+        light_llm_client=DelegationDummyLLM(),
+        tool_registry=ToolRegistry(),
+    )
+    runtime = TeamRuntime(
+        enabled=True,
+        workspace_dir=tmp_path,
+        team_name="default",
+        agent_name="lead",
+        agent_role="lead",
+        tool_registry=ToolRegistry(),
+        messages=[Message(role="system", content="x")],
+        session_id_provider=lambda: "sid",
+        round_provider=lambda: 1,
+        team_coordinator=coordinator,
+    )
+    status = runtime.get_status()
+    assert status["dispatch_enabled"] is True
+    assert "builder" in status["members"]
+    assert status["queue"]["global_limit"] >= 1
+
+
+def test_team_runtime_dispatch_task_uses_coordinator(tmp_path):
+    coordinator = TeamCoordinator(
+        workspace_dir=tmp_path,
+        main_llm_client=DelegationDummyLLM(),
+        light_llm_client=DelegationDummyLLM(),
+        tool_registry=ToolRegistry(),
+    )
+    runtime = TeamRuntime(
+        enabled=True,
+        workspace_dir=tmp_path,
+        team_name="default",
+        agent_name="lead",
+        agent_role="lead",
+        tool_registry=ToolRegistry(),
+        messages=[Message(role="system", content="x")],
+        session_id_provider=lambda: "sid",
+        round_provider=lambda: 1,
+        team_coordinator=coordinator,
+    )
+
+    result = runtime.dispatch_task(
+        agent_id="researcher",
+        title="Inspect docs",
+        instructions="Read docs and summarize",
+        context_summary="project context",
+    )
+    assert result.success is True
+    assert result.agent_id == "researcher"
+    task = coordinator.task_board.get_task(result.task_id)
+    assert task is not None
+    assert task["delegated_by"] == "lead"

@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import re
 import threading
+import uuid
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -34,6 +35,30 @@ class MessageBus:
         safe_name = self._normalize_name(name)
         return self.dir / f"{safe_name}.jsonl"
 
+    def _ack_path(self, name: str) -> Path:
+        safe_name = self._normalize_name(name)
+        return self.dir / f"{safe_name}.ack.json"
+
+    def _load_acked_ids(self, name: str) -> set[str]:
+        path = self._ack_path(name)
+        if not path.exists():
+            return set()
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return set()
+        values = payload.get("acked", [])
+        if not isinstance(values, list):
+            return set()
+        return {str(item) for item in values if str(item).strip()}
+
+    def _save_acked_ids(self, name: str, message_ids: set[str]) -> None:
+        path = self._ack_path(name)
+        path.write_text(
+            json.dumps({"acked": sorted(message_ids)}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
     def send(
         self,
         sender: str,
@@ -45,12 +70,17 @@ class MessageBus:
     ) -> dict[str, Any]:
         if msg_type not in VALID_MESSAGE_TYPES:
             raise ValueError(f"invalid msg_type: {msg_type}")
+        message_id = uuid.uuid4().hex[:12]
         message = TeamMessage(
             msg_type=msg_type,
             sender=self._normalize_name(sender),
             content=content or "",
             request_id=request_id,
-            extra=dict(extra or {}),
+            extra={
+                "to": self._normalize_name(to),
+                "message_id": message_id,
+                **dict(extra or {}),
+            },
         ).to_dict()
         inbox_path = self._inbox_path(to)
         with self._lock:
@@ -58,7 +88,13 @@ class MessageBus:
                 f.write(json.dumps(message, ensure_ascii=False) + "\n")
         return message
 
-    def read_inbox(self, name: str, drain: bool = True) -> list[dict[str, Any]]:
+    def read_inbox(
+        self,
+        name: str,
+        drain: bool = True,
+        *,
+        unread_only: bool = False,
+    ) -> list[dict[str, Any]]:
         inbox_path = self._inbox_path(name)
         if not inbox_path.exists():
             return []
@@ -76,6 +112,11 @@ class MessageBus:
                 messages.append(json.loads(payload))
             except json.JSONDecodeError:
                 continue
+        if unread_only:
+            acked = self._load_acked_ids(name)
+            messages = [
+                item for item in messages if str(item.get("message_id", "")).strip() not in acked
+            ]
         return messages
 
     def inbox_size(self, name: str) -> int:
@@ -96,3 +137,27 @@ class MessageBus:
             self.send(sender, teammate, content, msg_type=msg_type, extra=extra)
             count += 1
         return count
+
+    def ack_messages(self, name: str, message_ids: Iterable[str]) -> int:
+        ids = {str(mid).strip() for mid in message_ids if str(mid).strip()}
+        if not ids:
+            return 0
+        with self._lock:
+            acked = self._load_acked_ids(name)
+            before = len(acked)
+            acked.update(ids)
+            self._save_acked_ids(name, acked)
+            return len(acked) - before
+
+    def replay_inbox(
+        self,
+        name: str,
+        *,
+        limit: int = 50,
+        include_acked: bool = False,
+    ) -> list[dict[str, Any]]:
+        safe_limit = max(1, int(limit))
+        messages = self.read_inbox(name, drain=False, unread_only=not include_acked)
+        if len(messages) <= safe_limit:
+            return messages
+        return messages[-safe_limit:]

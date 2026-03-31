@@ -13,6 +13,19 @@ from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
+VALID_TASK_STATUSES = frozenset(
+    {
+        "pending",
+        "leased",
+        "in_progress",
+        "blocked",
+        "review",
+        "completed",
+        "failed",
+        "cancelled",
+    }
+)
+
 
 class TaskBoard:
     """Task board backed by .tasks/task_*.json files."""
@@ -49,6 +62,15 @@ class TaskBoard:
         blocked_by: Optional[list[int]] = None,
         blocks: Optional[list[int]] = None,
         worktree: str = "",
+        assignee: str = "",
+        delegated_by: str = "",
+        parent_task_id: Optional[int] = None,
+        artifact_dir: str = "",
+        priority: int = 3,
+        max_attempts: int = 2,
+        correlation_id: str = "",
+        request_id: str = "",
+        session_id: str = "",
     ) -> dict[str, Any]:
         clean_subject = (subject or "").strip()
         if not clean_subject:
@@ -63,9 +85,23 @@ class TaskBoard:
                 "description": (description or "").strip(),
                 "status": "pending",
                 "owner": "",
+                "assignee": (assignee or "").strip(),
+                "delegated_by": (delegated_by or "").strip(),
+                "parent_task_id": int(parent_task_id) if parent_task_id is not None else None,
+                "artifact_dir": (artifact_dir or "").strip(),
                 "blockedBy": list(blocked_by or []),
                 "blocks": list(blocks or []),
                 "worktree": (worktree or "").strip(),
+                "priority": int(priority),
+                "attempt": 0,
+                "max_attempts": max(1, int(max_attempts)),
+                "lease_owner": "",
+                "lease_expires_at": 0.0,
+                "failure_reason": "",
+                "artifact_manifest": "",
+                "correlation_id": (correlation_id or "").strip(),
+                "request_id": (request_id or "").strip(),
+                "session_id": (session_id or "").strip(),
                 "created_at": now,
                 "updated_at": now,
             }
@@ -120,12 +156,28 @@ class TaskBoard:
         return [
             task
             for task in tasks
-            if task.get("status") == "pending"
-            and not task.get("owner")
+            if self._can_claim(task)
             and not task.get("blockedBy")
         ]
 
-    def claim_task(self, task_id: int, owner: str) -> Optional[dict[str, Any]]:
+    def _lease_active(self, task: dict[str, Any]) -> bool:
+        expires = float(task.get("lease_expires_at", 0.0) or 0.0)
+        owner = str(task.get("lease_owner", "") or "").strip()
+        return bool(owner) and expires > time.time()
+
+    def _can_claim(self, task: dict[str, Any]) -> bool:
+        status = str(task.get("status", "pending"))
+        if status != "pending":
+            return False
+        if task.get("owner"):
+            return False
+        if self._lease_active(task):
+            return False
+        return True
+
+    def claim_task(
+        self, task_id: int, owner: str, *, lease_ttl_sec: int = 300
+    ) -> Optional[dict[str, Any]]:
         clean_owner = (owner or "").strip()
         if not clean_owner:
             raise ValueError("owner cannot be empty")
@@ -135,15 +187,15 @@ class TaskBoard:
             if not path.exists():
                 return None
             task = self._read_task(path)
-            if (
-                task.get("status") != "pending"
-                or task.get("owner")
-                or task.get("blockedBy")
-            ):
+            if not self._can_claim(task) or task.get("blockedBy"):
                 return None
+            now = time.time()
             task["owner"] = clean_owner
             task["status"] = "in_progress"
-            task["updated_at"] = time.time()
+            task["attempt"] = int(task.get("attempt", 0)) + 1
+            task["lease_owner"] = clean_owner
+            task["lease_expires_at"] = now + max(30, int(lease_ttl_sec))
+            task["updated_at"] = now
             self._write_task(task)
             return dict(task)
 
@@ -181,17 +233,83 @@ class TaskBoard:
         with self._lock:
             for path in sorted(self.dir.glob("task_*.json")):
                 task = self._read_task(path)
-                if (
-                    task.get("status") == "pending"
-                    and not task.get("owner")
-                    and not task.get("blockedBy")
-                ):
+                if self._can_claim(task) and not task.get("blockedBy"):
+                    now = time.time()
                     task["owner"] = owner
                     task["status"] = "in_progress"
-                    task["updated_at"] = time.time()
+                    task["attempt"] = int(task.get("attempt", 0)) + 1
+                    task["lease_owner"] = owner
+                    task["lease_expires_at"] = now + 300
+                    task["updated_at"] = now
                     self._write_task(task)
                     return dict(task)
         return None
+
+    def renew_lease(
+        self, task_id: int, owner: str, *, lease_ttl_sec: int = 300
+    ) -> Optional[dict[str, Any]]:
+        with self._lock:
+            path = self._task_path(task_id)
+            if not path.exists():
+                return None
+            task = self._read_task(path)
+            if task.get("owner") != owner:
+                return None
+            task["lease_owner"] = owner
+            task["lease_expires_at"] = time.time() + max(30, int(lease_ttl_sec))
+            task["updated_at"] = time.time()
+            self._write_task(task)
+            return dict(task)
+
+    def release_lease(
+        self, task_id: int, owner: str, *, to_status: str = "pending"
+    ) -> Optional[dict[str, Any]]:
+        clean_status = str(to_status).strip().lower()
+        if clean_status not in VALID_TASK_STATUSES:
+            raise ValueError(f"invalid task status: {to_status}")
+        with self._lock:
+            path = self._task_path(task_id)
+            if not path.exists():
+                return None
+            task = self._read_task(path)
+            if owner and task.get("owner") and task.get("owner") != owner:
+                return None
+            task["status"] = clean_status
+            task["owner"] = "" if clean_status == "pending" else task.get("owner", "")
+            task["lease_owner"] = ""
+            task["lease_expires_at"] = 0.0
+            task["updated_at"] = time.time()
+            self._write_task(task)
+            return dict(task)
+
+    def mark_failed(
+        self,
+        task_id: int,
+        *,
+        owner: str = "",
+        reason: str = "",
+        retryable: bool = False,
+    ) -> Optional[dict[str, Any]]:
+        with self._lock:
+            path = self._task_path(task_id)
+            if not path.exists():
+                return None
+            task = self._read_task(path)
+            if owner and task.get("owner") and task.get("owner") != owner:
+                return None
+            attempts = int(task.get("attempt", 0))
+            max_attempts = int(task.get("max_attempts", 1))
+            if retryable and attempts < max_attempts:
+                task["status"] = "pending"
+                task["owner"] = ""
+            else:
+                task["status"] = "failed"
+            task["failure_reason"] = str(reason or "").strip()
+            task["lease_owner"] = ""
+            task["lease_expires_at"] = 0.0
+            task["updated_at"] = time.time()
+            self._write_task(task)
+            return dict(task)
 
     def update_task(
         self,
@@ -201,6 +319,19 @@ class TaskBoard:
         owner: Optional[str] = None,
         add_blocked_by: Optional[list[int]] = None,
         add_blocks: Optional[list[int]] = None,
+        assignee: Optional[str] = None,
+        delegated_by: Optional[str] = None,
+        parent_task_id: Optional[int] = None,
+        artifact_dir: Optional[str] = None,
+        priority: Optional[int] = None,
+        max_attempts: Optional[int] = None,
+        lease_owner: Optional[str] = None,
+        lease_expires_at: Optional[float] = None,
+        failure_reason: Optional[str] = None,
+        artifact_manifest: Optional[str] = None,
+        correlation_id: Optional[str] = None,
+        request_id: Optional[str] = None,
+        session_id: Optional[str] = None,
     ) -> Optional[dict[str, Any]]:
         with self._lock:
             path = self._task_path(task_id)
@@ -210,6 +341,32 @@ class TaskBoard:
 
             if owner is not None:
                 task["owner"] = str(owner).strip()
+            if assignee is not None:
+                task["assignee"] = str(assignee).strip()
+            if delegated_by is not None:
+                task["delegated_by"] = str(delegated_by).strip()
+            if parent_task_id is not None:
+                task["parent_task_id"] = int(parent_task_id)
+            if artifact_dir is not None:
+                task["artifact_dir"] = str(artifact_dir).strip()
+            if priority is not None:
+                task["priority"] = int(priority)
+            if max_attempts is not None:
+                task["max_attempts"] = max(1, int(max_attempts))
+            if lease_owner is not None:
+                task["lease_owner"] = str(lease_owner).strip()
+            if lease_expires_at is not None:
+                task["lease_expires_at"] = float(lease_expires_at)
+            if failure_reason is not None:
+                task["failure_reason"] = str(failure_reason).strip()
+            if artifact_manifest is not None:
+                task["artifact_manifest"] = str(artifact_manifest).strip()
+            if correlation_id is not None:
+                task["correlation_id"] = str(correlation_id).strip()
+            if request_id is not None:
+                task["request_id"] = str(request_id).strip()
+            if session_id is not None:
+                task["session_id"] = str(session_id).strip()
 
             if add_blocked_by:
                 merged = set(task.get("blockedBy", []))
@@ -224,11 +381,14 @@ class TaskBoard:
 
             if status is not None:
                 clean_status = str(status).strip().lower()
-                if clean_status not in {"pending", "in_progress", "completed", "cancelled"}:
+                if clean_status not in VALID_TASK_STATUSES:
                     raise ValueError(f"invalid task status: {status}")
                 task["status"] = clean_status
                 if clean_status == "completed":
                     self._clear_dependency(int(task["id"]))
+                if clean_status in {"completed", "failed", "cancelled"}:
+                    task["lease_owner"] = ""
+                    task["lease_expires_at"] = 0.0
 
             task["updated_at"] = time.time()
             self._write_task(task)
@@ -243,6 +403,8 @@ class TaskBoard:
             if owner and task.get("owner") and task.get("owner") != owner:
                 return None
             task["status"] = "completed"
+            task["lease_owner"] = ""
+            task["lease_expires_at"] = 0.0
             task["updated_at"] = time.time()
             self._write_task(task)
             self._clear_dependency(int(task["id"]))
@@ -250,7 +412,9 @@ class TaskBoard:
 
     def get_stats(self) -> dict[str, int]:
         tasks = self.list_tasks()
-        stats = {"total": len(tasks), "pending": 0, "in_progress": 0, "completed": 0, "cancelled": 0}
+        stats = {"total": len(tasks)}
+        for status in sorted(VALID_TASK_STATUSES):
+            stats[status] = 0
         for task in tasks:
             status = task.get("status")
             if status in stats:

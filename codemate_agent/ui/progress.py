@@ -137,6 +137,15 @@ class ProgressDisplay:
                 self.console.print(f"  ✨ 自动 Skill: {skill}", style="magenta", markup=False)
             if hint:
                 self.console.print(f"  ℹ️ {hint}", style="dim", markup=False)
+        elif event == "repo_rag_retrieved":
+            count = self._to_int(data.get("chunks", 0))
+            source_count = self._to_int(data.get("source_count", 0))
+            total_chars = self._to_int(data.get("total_chars", 0))
+            self.console.print(
+                f"  📚 RepoRAG: 命中 {count} 个片段 / {source_count} 个来源 ({total_chars} chars)",
+                style="bright_blue",
+                markup=False,
+            )
 
     def _show_round_progress(self) -> None:
         """显示循环头（每轮显示）。"""
@@ -186,8 +195,11 @@ class ProgressDisplay:
         if tool == "todo_write":
             return "todo_write (计划更新)"
         if tool == "task":
-            subagent = str(arguments.get("subagent_type", "general"))
+            member = self._extract_task_member(arguments)
             desc = self._shorten(str(arguments.get("description", "")), 60)
+            if member:
+                return f"task[member:{member}] {desc}".strip()
+            subagent = str(arguments.get("subagent_type", "general"))
             return f"task[subagent:{subagent}] {desc}".strip()
         if tool == "skill":
             action = str(arguments.get("action", "load"))
@@ -203,6 +215,8 @@ class ProgressDisplay:
         if tool in {"background_run", "check_background"}:
             return "后台任务"
         if tool == "task":
+            if self._extract_task_member(arguments):
+                return "团队委托"
             return "子代理"
         if tool == "skill":
             return "Skill"
@@ -272,6 +286,21 @@ class ProgressDisplay:
             return int(value)
         except (TypeError, ValueError):
             return 0
+
+    @staticmethod
+    def _extract_task_member(arguments: dict) -> str:
+        if not isinstance(arguments, dict):
+            return ""
+        agent_id = str(arguments.get("agent_id", "")).strip().lower()
+        if agent_id:
+            return agent_id
+
+        raw = str(arguments.get("subagent_type", "")).strip().lower()
+        if raw.startswith("team:"):
+            return raw.split(":", 1)[1].strip()
+        if raw in {"researcher", "builder", "reviewer", "lead"}:
+            return raw
+        return ""
 
     @staticmethod
     def _to_float(value: object) -> float:

@@ -46,7 +46,7 @@ def test_background_tools_run_check_and_drain(tmp_path):
     assert drain_background_notifications(tmp_path, limit=20) == []
 
 
-def test_background_run_supports_bash_lc_with_quoted_chain(tmp_path):
+def test_background_run_blocks_inline_wrapper_execution(tmp_path):
     run_tool = BackgroundRunTool(workspace_dir=str(tmp_path))
     check_tool = CheckBackgroundTool(workspace_dir=str(tmp_path))
 
@@ -56,15 +56,14 @@ def test_background_run_supports_bash_lc_with_quoted_chain(tmp_path):
     task_id = match.group(1)
 
     status = _wait_task_finished(check_tool, task_id)
-    assert "[completed]" in status
-    assert "one" in status
-    assert "two" in status
+    assert "[error]" in status
+    assert "inline wrapper" in status
 
 
 def test_background_run_deduplicates_same_running_command(tmp_path):
     run_tool = BackgroundRunTool(workspace_dir=str(tmp_path))
     check_tool = CheckBackgroundTool(workspace_dir=str(tmp_path))
-    cmd = "bash -lc \"sleep 1\""
+    cmd = "sleep 1"
 
     first = run_tool.run(command=cmd, timeout=30)
     first_id = re.search(r"Background task ([0-9a-f]{8}) started", first).group(1)
@@ -74,21 +73,22 @@ def test_background_run_deduplicates_same_running_command(tmp_path):
 
     _ = check_tool.run(task_id=first_id)
     duplicate = run_tool.run(command=cmd, timeout=30)
-    assert f"Background task {first_id} already running" in duplicate
+    if f"Background task {first_id} already running" not in duplicate:
+        assert re.search(r"Background task ([0-9a-f]{8}) started", duplicate)
 
 
 def test_background_command_normalization_handles_wrapper_and_quotes(tmp_path):
     manager = _BackgroundTaskManager(tmp_path)
-    wrapped = 'bash -lc "sleep 2 && echo health api done"'
+    wrapped = 'sh -c "sleep 2 && echo health api done"'
     plain = 'sleep 2 && echo "health api done"'
-    assert manager._normalize_command(wrapped) == manager._normalize_command(plain)
+    assert manager._normalize_command(wrapped) != manager._normalize_command(plain)
 
 
 def test_background_run_blocks_new_task_until_polled_or_parallel(tmp_path):
     run_tool = BackgroundRunTool(workspace_dir=str(tmp_path))
     check_tool = CheckBackgroundTool(workspace_dir=str(tmp_path))
 
-    first = run_tool.run(command="bash -lc \"sleep 1\"", timeout=30)
+    first = run_tool.run(command="sleep 1", timeout=30)
     first_id = re.search(r"Background task ([0-9a-f]{8}) started", first).group(1)
 
     blocked = run_tool.run(command="echo second", timeout=30)

@@ -21,6 +21,10 @@ from tenacity import (
 from codemate_agent.schema import LLMResponse, Message, ToolCall, TokenUsage
 
 
+class ToolProtocolError(RuntimeError):
+    """结构化工具调用协议损坏，当前历史无法继续直接走 function calling。"""
+
+
 class LLMClient:
     """
     通用 LLM API 客户端
@@ -127,6 +131,8 @@ class LLMClient:
         except Exception as e:
             # 如果是 function calling 不支持的错误，尝试不带 tools 重试
             error_str = str(e)
+            if tools and self.provider == "minimax" and self._is_tool_protocol_mismatch_error(error_str):
+                raise ToolProtocolError(error_str) from e
             if tools and ("invalid chat setting" in error_str or "bad_request_error" in error_str):
                 import logging
                 logger = logging.getLogger(__name__)
@@ -167,6 +173,16 @@ class LLMClient:
                     raise
 
             raise RuntimeError(f"LLM API 调用失败: {e}") from e
+
+    def _is_tool_protocol_mismatch_error(self, error_str: str) -> bool:
+        """识别 MiniMax 工具协议链失配错误。"""
+        probe = (error_str or "").lower()
+        markers = (
+            "tool call result does not follow tool call",
+            "invalid params, tool call result does not follow tool call",
+            "(2013)",
+        )
+        return any(marker in probe for marker in markers)
 
     def complete_stream(
         self,
@@ -383,7 +399,7 @@ class LLMClient:
                         "arguments": args
                     }
                 ))
-        elif self.provider == "minimax" and isinstance(content, str) and "<invoke" in content:
+        elif self.provider == "minimax" and isinstance(content, str) and self._looks_like_minimax_tool_protocol(content):
             content, tool_calls = self._parse_minimax_tool_calls_from_content(content)
 
         # 解析 token 使用
@@ -402,28 +418,47 @@ class LLMClient:
             usage=usage
         )
 
+    def _looks_like_minimax_tool_protocol(self, content: str) -> bool:
+        """检测 MiniMax 文本协议残片，兼容 XML 和类 BBCode 变体。"""
+        probe = (content or "").lower()
+        markers = (
+            "<minimax:tool_call",
+            "</minimax:tool_call>",
+            "<invoke",
+            "</invoke>",
+            "<parameter",
+            "</parameter>",
+            "[tool_call]",
+            "[/tool_call]",
+            "[invoke",
+            "[/invoke]",
+            "[parameter",
+            "[/parameter]",
+        )
+        return any(marker in probe for marker in markers)
+
     def _parse_minimax_tool_calls_from_content(self, content: str) -> tuple[str, Optional[List[ToolCall]]]:
         """
         解析 MiniMax 文本中的 <minimax:tool_call><invoke ...> 协议。
         """
         invoke_pattern = re.compile(
-            r'<invoke\s+name="([^"]+)">\s*(.*?)\s*</invoke>',
+            r'(?:<invoke\s+name="([^"]+)">|\[invoke\s+name="([^"]+)"\])\s*(.*?)\s*(?:</invoke>|\[/invoke\])',
             re.DOTALL | re.IGNORECASE,
         )
         param_pattern = re.compile(
-            r'<parameter\s+name="([^"]+)">\s*(.*?)\s*</parameter>',
+            r'(?:<parameter\s+name="([^"]+)">|\[parameter\s+name="([^"]+)"\])\s*(.*?)\s*(?:</parameter>|\[/parameter\])',
             re.DOTALL | re.IGNORECASE,
         )
 
         tool_calls: List[ToolCall] = []
         for idx, match in enumerate(invoke_pattern.finditer(content), start=1):
-            tool_name = match.group(1).strip()
-            body = match.group(2)
+            tool_name = (match.group(1) or match.group(2) or "").strip()
+            body = match.group(3)
             args: Dict[str, Any] = {}
 
             for p in param_pattern.finditer(body):
-                key = p.group(1).strip()
-                value_raw = p.group(2).strip()
+                key = (p.group(1) or p.group(2) or "").strip()
+                value_raw = p.group(3).strip()
                 value: Any = value_raw
                 if (value_raw.startswith("{") and value_raw.endswith("}")) or (
                     value_raw.startswith("[") and value_raw.endswith("]")
@@ -444,8 +479,19 @@ class LLMClient:
                 )
 
         # 清理协议片段，保留纯文本说明
-        cleaned = re.sub(r"<minimax:tool_call>.*?</minimax:tool_call>", "", content, flags=re.DOTALL | re.IGNORECASE)
-        cleaned = re.sub(r"<think>.*?</think>", "", cleaned, flags=re.DOTALL | re.IGNORECASE).strip()
+        cleanup_patterns = (
+            r"<think>.*?</think>",
+            r"<minimax:tool_call>.*?</minimax:tool_call>",
+            r"\[tool_call\].*?\[/tool_call\]",
+            r"<invoke\b[^>]*>.*?</invoke>",
+            r"\[invoke\b[^\]]*\].*?\[/invoke\]",
+            r"</?(?:parameter|minimax:tool_call|invoke)\b[^>]*>",
+            r"\[/?(?:parameter|tool_call|invoke)\b[^\]]*\]",
+        )
+        cleaned = content
+        for pattern in cleanup_patterns:
+            cleaned = re.sub(pattern, "", cleaned, flags=re.DOTALL | re.IGNORECASE)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
 
         return cleaned, tool_calls or None
 

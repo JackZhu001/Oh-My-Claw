@@ -1,68 +1,85 @@
-# CodeMate Agent 项目报告（2026 刷新版）
+# CodeMate Agent 项目报告（2026-03-31）
 
 ## 1. 项目定位
 
-CodeMate Agent 是一个面向真实代码仓库的终端工程助手，强调“可执行、可追踪、可恢复”的多轮开发流程。
-当前默认模型与运行配置以 **MiniMax-M2** 为核心，并保留多提供商兼容能力。
+CodeMate Agent 是一个终端优先的工程型 AI Agent，目标是将大模型能力稳定落地到真实代码仓库任务中。  
+项目强调：
 
-## 2. 当前核心能力
+- **执行闭环**：任务必须通过工具落地，而非只生成建议文本。
+- **长链路稳定**：面对复杂任务，提供压缩、检索、重试和失败纠偏。
+- **过程可审计**：任务、事件、会话和产物都有结构化记录。
 
-- 原生 Function Calling + 工具注册器
-- 任务规划（复杂任务自动生成 TODO）
-- 心跳与看门狗（长任务可观测）
-- 上下文工程（微压缩 / 自动压缩 / 手动 `/compact`）
-- 长期记忆（BM25 检索）+ 项目记忆（`/init` 生成 `codemate.md`）
-- 多会话持久化（trace / metrics / session）
+## 2. 当前能力概览
 
-## 3. 架构概览
+### 2.1 Agent 执行层
 
-```text
-CLI (codemate_agent/cli.py)
-  -> CodeMateAgent (agent/agent.py)
-    -> LLMClient (llm/client.py)
-    -> ToolRegistry (tools/registry.py)
-    -> Planner (planner/planner.py)
-    -> ContextCompressor (context/compressor.py)
-    -> MemoryManager (persistence/memory.py)
-    -> Trace/Metrics (logging/)
-```
+- Function Calling 主循环
+- 工具注册与统一参数验证
+- LoopGuard/LoopDetector 防止空转、重复失败、提前结束
+- 兼容 MiniMax 工具协议与降级重试链路
 
-## 4. MiniMax 兼容策略（当前实现）
+### 2.2 上下文与记忆层
 
-为提升 MiniMax 稳定性，已引入以下机制：
+- 三层压缩：Micro / Auto / Manual (`/compact`)
+- RepoRAG：按 query 召回 memory、根目录文档、`docs/`、代码片段
+- 工具输出截断：按工具类型保留高价值上下文
+- 会话与 transcript 持久化
 
-1. 多 `system` 消息规整：仅保留首条 system，后续转为用户说明文本。
-2. 工具历史混合保留：最近 2 轮保留结构化 tool_call，旧轮降级为文本上下文。
-3. 文本协议兼容：支持从 MiniMax 返回的 `<minimax:tool_call><invoke ...>` 内容中恢复工具调用。
-4. 多级降级重试：tools -> text-only -> minimal -> single-user prompt。
+### 2.3 团队协作层
 
-## 5. 运行与配置
+- TeamRuntime + Coordinator + Executor
+- 角色分工：`lead/researcher/builder/reviewer`
+- TaskBoard + MessageBus + RequestTracker + EventLog
+- strict 模式阶段约束（researcher -> builder -> reviewer）
 
-最小 `.env`：
+### 2.4 观测与运维层
+
+- 心跳与看门狗超时告警
+- trace / metrics / session 持久化
+- CLI 实时进度展示
+
+## 3. 核心工程价值
+
+1. **从“回答器”升级为“执行器”**  
+通过工具链完成真实读写和命令执行，缩小建议与落地之间的鸿沟。
+
+2. **从“短会话”升级为“可持续工程流”**  
+在长任务里依靠压缩 + 检索 + 状态管理维持上下文一致性。
+
+3. **从“单体 Agent”升级为“角色化协作”**  
+在团队模式下将调研、实现、验收分层，减少单轮决策噪声。
+
+## 4. 当前风险与技术债
+
+- 上游模型（尤其 MiniMax）在高负载场景下仍可能出现 500/520/超时。
+- Team 任务成功判定目前偏依赖成员摘要，后验产物校验仍需持续增强。
+- `.tasks` 持久化任务在异常中断后的回收策略仍有优化空间。
+- RepoRAG 在大仓库下仍存在每轮重建文档的性能压力。
+
+## 5. 近期改进重点（建议）
+
+1. 强化 team 成员执行安全边界（高风险 shell 命令策略隔离）
+2. 增加任务租约过期回收机制，避免 in_progress 僵尸任务
+3. 在 coordinator 层增加“产物验收谓词”，减少假阳性完成
+4. 优化 RepoRAG 索引缓存，降低重复扫描成本
+
+## 6. 运行与验证
+
+最小启动配置：
 
 ```bash
 API_PROVIDER=minimax
-BASE_URL=https://api.minimax.chat/v1
-API_KEY=your_api_key_here
+API_KEY=your_api_key
 MODEL=MiniMax-M2
-MAX_ROUNDS=50
+BASE_URL=https://api.minimax.chat/v1
 ```
 
-启动：
+本地回归命令：
 
 ```bash
-python -m codemate_agent.cli
+pytest -q
 ```
 
-## 6. 测试状态
+---
 
-当前主分支本地回归：
-
-- `pytest -q`
-- 46 passed
-
-## 7. 后续建议
-
-- 将“MiniMax 结构化历史保留轮数”开放为环境变量
-- 增加 heartbeat/催办策略参数的发布文档示例（超时、轮询、开关）
-- 补充端到端回归（复杂网页生成 / MCP 失败降级 / 多工具链路）
+结论：项目已形成完整工程闭环，适合进入“稳定性与交付质量优先”的下一阶段迭代。
