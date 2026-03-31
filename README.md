@@ -1,11 +1,11 @@
-# CodeMate Agent
+# Oh-My-Claw
 
-面向真实代码仓库的终端 AI 工程助手。  
-核心目标不是“聊得好”，而是“能稳定把工程任务做完”。
+一只会写代码、会看日志、会盯进度的工程猫爪助手。  
+目标很直接：不只“会聊天”，而是“能把工程任务稳稳做完”。
 
 ## 项目定位
 
-CodeMate 聚焦三件事：
+Oh-My-Claw 聚焦三件事：
 
 - 可执行：LLM 决策与工具调用闭环，真正读写项目文件并推进任务。
 - 可持续：长任务场景下，靠压缩与检索避免上下文崩塌。
@@ -81,6 +81,8 @@ cd CodeMate-Agent
 pip install -r requirements.txt
 ```
 
+> 说明：当前仓库名与 Python 包名仍保留 `codemate_*` 以兼容历史脚本；对外展示品牌已统一为 **Oh-My-Claw**。
+
 ### 2. 配置 `.env`
 
 最小配置：
@@ -107,6 +109,12 @@ python -m codemate_agent.cli
 
 ```bash
 ./run.sh
+```
+
+安装后也可直接使用新命令名：
+
+```bash
+ohmyclaw
 ```
 
 ## 常用命令

@@ -44,7 +44,7 @@ def test_system_prompt_includes_codemate_and_retrieved_memory(tmp_path):
     memory.save_custom_memory("# 自定义记忆\n\n## 部署\n生产环境用 Kubernetes。")
     workspace = tmp_path / "workspace"
     workspace.mkdir(parents=True, exist_ok=True)
-    (workspace / "codemate.md").write_text("# CodeMate 项目记忆\n\n- 用户偏好：简洁回答", encoding="utf-8")
+    (workspace / "codemate.md").write_text("# Oh-My-Claw 项目记忆\n\n- 用户偏好：简洁回答", encoding="utf-8")
     docs_dir = workspace / "docs"
     docs_dir.mkdir()
     (docs_dir / "deploy.md").write_text("# 部署说明\n\n## Kubernetes\n使用 Kubernetes 部署生产环境。", encoding="utf-8")
@@ -67,7 +67,7 @@ def test_system_prompt_skips_repo_rag_for_greeting(tmp_path):
     memory = MemoryManager(tmp_path / "memory")
     workspace = tmp_path / "workspace"
     workspace.mkdir(parents=True, exist_ok=True)
-    (workspace / "codemate.md").write_text("# CodeMate 项目记忆\n\n- 规则", encoding="utf-8")
+    (workspace / "codemate.md").write_text("# Oh-My-Claw 项目记忆\n\n- 规则", encoding="utf-8")
 
     agent = CodeMateAgent(
         llm_client=DummyLLM(),

@@ -1,1 +1,1 @@
-"""CodeMate AI 测试套件"""
+"""Oh-My-Claw 测试套件"""

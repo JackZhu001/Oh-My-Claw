@@ -57,7 +57,7 @@ MAX_INLINE_FILE_CONTENT = 3000
 
 class CodeMateAgent:
     """
-    CodeMate Agent
+    Oh-My-Claw Agent
 
     使用原生 Function Calling 进行代码分析的 AI Agent。
 

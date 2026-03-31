@@ -1,5 +1,5 @@
 """
-CodeMate AI CLI
+Oh-My-Claw CLI
 
 命令行交互入口。
 """
@@ -390,7 +390,7 @@ def run_interactive(config: Config) -> None:
                 continue
 
             # 运行 Agent
-            console.print("\n[bold yellow]🐾 CodeMate:[/bold yellow] [dim]思考中...[/dim]\n")
+            console.print("\n[bold yellow]🐾 Oh-My-Claw:[/bold yellow] [dim]思考中...[/dim]\n")
 
             try:
                 result = agent.run(user_input)
@@ -545,13 +545,13 @@ def run_single_prompt(prompt: str, config: Config) -> None:
 def main() -> None:
     """主入口"""
     parser = argparse.ArgumentParser(
-        description="CodeMate AI - 基于 Function Calling 的代码分析 Agent",
+        description="Oh-My-Claw - 基于 Function Calling 的工程执行型代码助手",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
-  codemate                    # 交互模式
-  codemate "分析这个项目"     # 单次查询
-  codemate --model MiniMax-M2 # 使用指定模型
+  ohmyclaw                    # 交互模式（推荐）
+  ohmyclaw "分析这个项目"     # 单次查询
+  codemate --model MiniMax-M2 # 兼容旧命令
         """
     )
 
@@ -576,7 +576,7 @@ def main() -> None:
     parser.add_argument(
         "--version", "-v",
         action="version",
-        version="codemate-agent 0.3.0"
+        version="oh-my-claw 0.3.0"
     )
 
     args = parser.parse_args()

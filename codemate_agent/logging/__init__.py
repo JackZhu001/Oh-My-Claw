@@ -1,5 +1,5 @@
 """
-CodeMate Agent 日志系统
+Oh-My-Claw 日志系统
 
 提供三层日志架构：
 1. 基础运行时日志 (Rich 美化输出)

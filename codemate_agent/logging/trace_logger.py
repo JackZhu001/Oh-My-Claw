@@ -240,7 +240,7 @@ class TraceLogger:
         try:
             with open(self.md_path, "w", encoding="utf-8") as f:
                 # 标题
-                f.write(f"# CodeMate Agent 执行轨迹\n\n")
+                f.write(f"# Oh-My-Claw 执行轨迹\n\n")
                 f.write(f"**会话 ID**: `{self.session_id}`\n\n")
                 f.write(f"**开始时间**: {self._start_time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
                 if self._end_time:

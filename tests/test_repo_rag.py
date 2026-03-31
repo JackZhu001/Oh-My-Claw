@@ -7,7 +7,7 @@ def test_repo_rag_retrieves_workspace_docs_and_codemate(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     (workspace / "codemate.md").write_text(
-        "# CodeMate 项目记忆\n\n## 关键约定\n- 部署方式：Kubernetes\n",
+        "# Oh-My-Claw 项目记忆\n\n## 关键约定\n- 部署方式：Kubernetes\n",
         encoding="utf-8",
     )
     docs_dir = workspace / "docs"

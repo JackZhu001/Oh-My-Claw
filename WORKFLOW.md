@@ -1,4 +1,4 @@
-# CodeMate Agent 工作流说明（2026-03-31）
+# Oh-My-Claw 工作流说明（2026-03-31）
 
 ## 1. 主循环（ReAct + Function Calling）
 

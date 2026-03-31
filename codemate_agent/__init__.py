@@ -1,5 +1,5 @@
 """
-CodeMate AI - 基于 Function Calling 范式的代码分析 Agent
+Oh-My-Claw - 基于 Function Calling 范式的工程执行型代码助手
 
 使用 GLM/MiniMax API 实现智能代码分析、项目理解和重构建议。
 """

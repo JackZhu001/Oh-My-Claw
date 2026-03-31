@@ -1,7 +1,7 @@
 """
 示例项目 - 简单的待办事项应用
 
-这是一个用于测试 CodeMate AI 的示例项目。
+这是一个用于测试 Oh-My-Claw 的示例项目。
 """
 
 from typing import List
@@ -57,7 +57,7 @@ def main():
 
     # 添加示例待办事项
     manager.add("学习 ReAct Agent", "理解思考-行动-观察循环")
-    manager.add("实现 CodeMate", "基于 GLM 的代码分析助手")
+    manager.add("实现 Oh-My-Claw", "基于 GLM 的代码分析助手")
 
     # 列出待办事项
     print("待办事项列表:")

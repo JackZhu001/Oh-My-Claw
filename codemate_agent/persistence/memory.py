@@ -321,7 +321,7 @@ src/
 
         tools = tools or []
         tools_text = ", ".join(tools[:20]) if tools else "（待补充）"
-        template = f"""# CodeMate 项目记忆
+        template = f"""# Oh-My-Claw 项目记忆
 
 > 这个文件会在每轮对话中注入上下文，可手动维护项目事实、偏好、约束。
 

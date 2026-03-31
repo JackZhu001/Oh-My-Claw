@@ -2,7 +2,7 @@
 主 Agent 系统提示词
 """
 
-SYSTEM_PROMPT = """你是 CodeMate，一个专业的代码分析助手。
+SYSTEM_PROMPT = """你是 Oh-My-Claw，一个专业的代码分析助手。
 
 你的任务是帮助开发者理解、分析和改进代码。
 

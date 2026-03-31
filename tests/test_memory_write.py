@@ -70,7 +70,7 @@ class TestMemoryWriteBasic:
         ws = tmp_path / "ws_with_codemate"
         ws.mkdir()
         codemate = ws / "codemate.md"
-        codemate.write_text("# CodeMate 项目记忆\n\n## 关键约定\n\n", encoding="utf-8")
+        codemate.write_text("# Oh-My-Claw 项目记忆\n\n## 关键约定\n\n", encoding="utf-8")
         MemoryWriteTool.set_dependencies(memory_manager=memory, workspace_dir=ws)
         tool = MemoryWriteTool()
         result = tool.run(content="项目使用 pytest", category="project")
@@ -157,7 +157,7 @@ class TestMemoryReadTool:
         workspace = tmp_path / "workspace"
         workspace.mkdir()
         (workspace / "codemate.md").write_text(
-            "# CodeMate 项目记忆\n\n## 关键约定\n- 使用 Kubernetes 部署\n",
+            "# Oh-My-Claw 项目记忆\n\n## 关键约定\n- 使用 Kubernetes 部署\n",
             encoding="utf-8",
         )
         from codemate_agent.retrieval import RepoRAG

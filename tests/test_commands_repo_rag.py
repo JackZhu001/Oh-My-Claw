@@ -28,7 +28,7 @@ def test_rag_command_shows_retrieved_context(tmp_path, monkeypatch):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     (workspace / "codemate.md").write_text(
-        "# CodeMate 项目记忆\n\n## 关键约定\n- 使用 Kubernetes 部署\n",
+        "# Oh-My-Claw 项目记忆\n\n## 关键约定\n- 使用 Kubernetes 部署\n",
         encoding="utf-8",
     )
     docs_dir = workspace / "docs"

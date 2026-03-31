@@ -1,7 +1,7 @@
 [project]
-name = "codemate-agent"
+name = "oh-my-claw"
 version = "0.1.0"
-description = "CodeMate AI - 基于 ReAct 范式的代码分析 Agent"
+description = "Oh-My-Claw - 基于 Function Calling 的工程执行型代码助手"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
@@ -38,6 +38,7 @@ dev = [
 
 [project.scripts]
 codemate = "codemate_agent.cli:main"
+ohmyclaw = "codemate_agent.cli:main"
 
 [build-system]
 requires = ["hatchling"]

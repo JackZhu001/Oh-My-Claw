@@ -1,5 +1,5 @@
 #!/bin/bash
-# CodeMate AI 启动脚本
+# Oh-My-Claw 启动脚本
 
 CONDA_PATH="/Users/zyxsmac/miniconda3"
 ENV_NAME="codemate"
@@ -26,5 +26,5 @@ if grep -q "your_api_key_here" .env; then
 fi
 
 # 运行
-echo "🚀 启动 CodeMate AI..."
+echo "🚀 启动 Oh-My-Claw..."
 $CONDA_PATH/bin/conda run -n $ENV_NAME python -m codemate_agent.cli "$@"
